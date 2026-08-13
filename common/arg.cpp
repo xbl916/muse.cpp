@@ -1710,6 +1710,74 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
+        {"--scheduler"}, "{slots,paged}",
+        "server scheduler mode",
+        [](common_params & params, const std::string & value) {
+            if (value != "slots" && value != "paged") {
+                throw std::invalid_argument("scheduler must be slots or paged");
+            }
+            params.scheduler = value;
+        }
+    ).set_env("LLAMA_ARG_SCHEDULER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--paged-admission"}, "{actual-len,full-ctx}",
+        "paged request admission policy (default: actual-len)",
+        [](common_params & params, const std::string & value) {
+            if (value != "actual-len" && value != "full-ctx") {
+                throw std::invalid_argument("paged admission must be actual-len or full-ctx");
+            }
+            params.paged_admission = value;
+        }
+    ).set_env("LLAMA_ARG_PAGED_ADMISSION").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--gpu-memory-utilization"}, "FLOAT",
+        string_format("paged KV target GPU memory utilization (default: %.2f)", params.paged_gpu_memory_utilization),
+        [](common_params & params, const std::string & value) {
+            params.paged_gpu_memory_utilization = std::stof(value);
+            if (params.paged_gpu_memory_utilization <= 0.0f || params.paged_gpu_memory_utilization > 1.0f) {
+                throw std::invalid_argument("gpu memory utilization must be greater than 0 and at most 1");
+            }
+        }
+    ).set_env("LLAMA_ARG_GPU_MEMORY_UTILIZATION").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-block-size"}, "N",
+        string_format("paged KV block size (default: %d)", params.kv_block_size),
+        [](common_params & params, int value) {
+            if (value <= 0 || (value & (value - 1)) != 0) {
+                throw std::invalid_argument("kv block size must be a positive power of two");
+            }
+            params.kv_block_size = value;
+        }
+    ).set_env("LLAMA_ARG_KV_BLOCK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--max-model-len"}, "N",
+        "maximum context length for one paged request",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("max model length must be positive");
+            }
+            params.max_model_len = value;
+        }
+    ).set_env("LLAMA_ARG_MAX_MODEL_LEN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--max-num-seqs"}, "N",
+        "maximum number of active paged sequences",
+        [](common_params & params, int value) {
+            if (value <= 0 || value > 256) {
+                throw std::invalid_argument("max number of sequences must be in [1, 256]");
+            }
+            params.n_parallel_max = value;
+        }
+    ).set_env("LLAMA_ARG_MAX_NUM_SEQS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-prefix-cache"},
+        {"--no-kv-prefix-cache"},
+        "enable prompt prefix caching in paged mode",
+        [](common_params & params, bool value) {
+            params.kv_prefix_cache = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PREFIX_CACHE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

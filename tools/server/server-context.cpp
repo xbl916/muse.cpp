@@ -1324,6 +1324,15 @@ private:
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false");
 
+        if (params_base.scheduler == "paged") {
+            const uint64_t total_blocks = llama_memory_n_free_blocks(llama_get_memory(ctx_tgt));
+            const uint64_t pool_tokens = total_blocks * params_base.kv_block_size;
+            const uint64_t max_seq_tokens = llama_n_ctx_seq(ctx_tgt);
+            const uint64_t full_sequences = max_seq_tokens > 0 ? pool_tokens / max_seq_tokens : 0;
+            SRV_INF("paged KV capacity: pool = %" PRIu64 " tokens (%" PRIu64 " blocks x %d), max request = %" PRIu64 " tokens, full-length sequences = %" PRIu64 ", active sequence limit = %d\n",
+                    pool_tokens, total_blocks, params_base.kv_block_size, max_seq_tokens, full_sequences, params_base.n_parallel_max);
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
@@ -1583,6 +1592,65 @@ private:
         return nullptr;
     }
 
+    bool ensure_paged_capacity(const server_task & task, server_slot & selected) {
+        if (params_base.scheduler != "paged") {
+            return true;
+        }
+
+        llama_memory_t memory = llama_get_memory(ctx_tgt);
+        const uint32_t block_size = params_base.kv_block_size;
+        const uint32_t prompt_pages = (task.tokens.size() + block_size - 1) / block_size;
+        const uint32_t prefix_tokens = selected.prompt.tokens.get_common_prefix(task.tokens);
+        const uint32_t prefix_pages = (prefix_tokens + block_size - 1) / block_size;
+        const uint32_t cached_pages = (selected.prompt.tokens.size() + block_size - 1) / block_size;
+        const uint32_t decode_pages = task.tokens.size() % block_size == 0 ? 1 : 0;
+        uint32_t needed = prompt_pages > prefix_pages ? prompt_pages - prefix_pages + decode_pages : decode_pages;
+        const uint32_t reclaimable = cached_pages > prefix_pages ? cached_pages - prefix_pages : 0;
+
+        uint32_t reserved = 0;
+        if (params_base.paged_admission == "full-ctx") {
+            const uint32_t max_pages = (selected.n_ctx + block_size - 1) / block_size;
+            needed = max_pages > prefix_pages ? max_pages - prefix_pages : 0;
+
+            for (const auto & slot : slots) {
+                if (&slot == &selected || !slot.is_processing()) {
+                    continue;
+                }
+                const uint32_t used_pages = (slot.prompt.tokens.pos_next() + block_size - 1) / block_size;
+                if (max_pages > used_pages) {
+                    reserved += max_pages - used_pages;
+                }
+            }
+        }
+
+        auto available = [&]() {
+            const uint32_t blocks = llama_memory_n_free_blocks(memory) + reclaimable;
+            return blocks > reserved ? blocks - reserved : 0;
+        };
+
+        while (available() < needed) {
+            server_slot * victim = nullptr;
+            for (auto & slot : slots) {
+                if (&slot == &selected || slot.is_processing() || slot.prompt.tokens.empty()) {
+                    continue;
+                }
+                if (!victim || slot.t_last_used < victim->t_last_used) {
+                    victim = &slot;
+                }
+            }
+
+            if (!victim) {
+                return false;
+            }
+
+            SLT_DBG(*victim, "%s", "evicting idle paged KV blocks\n");
+            llama_memory_seq_rm(memory, victim->id, 0, -1);
+            victim->prompt.clear();
+        }
+
+        return true;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1673,6 +1741,11 @@ private:
         }
 
         if (ret) {
+            if (!ensure_paged_capacity(task, *ret)) {
+                SRV_DBG("paged KV admission deferred, free_blocks = %u\n", llama_memory_n_free_blocks(llama_get_memory(ctx_tgt)));
+                return nullptr;
+            }
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks
@@ -2987,10 +3060,24 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        uint32_t paged_free_blocks = params_base.scheduler == "paged" ?
+            llama_memory_n_free_blocks(llama_get_memory(ctx_tgt)) : UINT32_MAX;
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
+            }
+
+            if (params_base.scheduler == "paged" && slot.prompt.tokens.pos_next() % params_base.kv_block_size == 0) {
+                while (paged_free_blocks == 0 && try_clear_idle_slots()) {
+                    paged_free_blocks = llama_memory_n_free_blocks(llama_get_memory(ctx_tgt));
+                }
+                if (paged_free_blocks == 0) {
+                    SLT_DBG(slot, "%s", "waiting for a free paged KV block\n");
+                    return;
+                }
+                --paged_free_blocks;
             }
 
             // check if we can batch this slot with the previous one
@@ -4050,6 +4137,8 @@ server_context_meta server_context::get_meta() const {
         /* has_inp_video          */ impl->chat_params.allow_video,
         /* json_ui_settings       */ impl->json_ui_settings,
         /* slot_n_ctx             */ impl->get_slot_n_ctx(),
+        /* kv_pool_tokens         */ impl->params_base.paged_kv ? int(llama_n_ctx(impl->ctx_tgt)) : 0,
+        /* kv_block_size          */ impl->params_base.paged_kv ? impl->params_base.kv_block_size : 0,
         /* pooling_type           */ llama_pooling_type(impl->ctx_tgt),
 
         /* chat_params            */ impl->chat_params,
@@ -4633,6 +4722,12 @@ void server_routes::init_routes() {
         json props = {
             { "default_generation_settings", default_generation_settings_for_props },
             { "total_slots",                 params.n_parallel },
+            { "kv_cache",                    json {
+                { "paged",        meta->kv_block_size > 0 },
+                { "pool_tokens",  meta->kv_pool_tokens },
+                { "block_size",   meta->kv_block_size },
+                { "total_blocks", meta->kv_block_size > 0 ? meta->kv_pool_tokens / meta->kv_block_size : 0 },
+            } },
             { "model_alias",                 meta->model_name },
             { "model_ftype",                 meta->model_ftype },
             { "model_path",                  meta->model_path },

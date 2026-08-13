@@ -59,6 +59,10 @@ struct llama_memory_context_i {
     // return false on failure
     virtual bool apply() = 0;
 
+    virtual bool requires_synchronize() const {
+        return false;
+    }
+
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;
 
@@ -81,6 +85,16 @@ struct llama_memory_i {
     using layer_share_cb = std::function<int32_t(int32_t il)>;
 
     virtual ~llama_memory_i() = default;
+
+    virtual bool configure_paged(uint32_t block_size, uint32_t max_seq_tokens) {
+        GGML_UNUSED(block_size);
+        GGML_UNUSED(max_seq_tokens);
+        return false;
+    }
+
+    virtual uint32_t get_n_free_blocks() const {
+        return 0;
+    }
 
     // split the input batch into a set of ubatches and verify that they can fit into the cache
     // return a context object containing the ubatches and memory state required to process them

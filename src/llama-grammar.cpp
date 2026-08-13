@@ -651,7 +651,7 @@ const char * llama_grammar_parser::parse_sequence(
             if (min_times > MAX_REPETITION_THRESHOLD) {
                 throw std::runtime_error(std::string("number of repetitions exceeds sane defaults, please reduce the number of repetitions"));
             }
-            if (max_times != UINT64_MAX && max_times > MAX_REPETITION_THRESHOLD) {
+            if (max_times != UINT64_MAX && max_times >= MAX_REPETITION_THRESHOLD) {
                 max_times = UINT64_MAX;
             }
             handle_repetitions(min_times, max_times);
@@ -1521,4 +1521,3 @@ void llama_grammar_accept_token(struct llama_grammar & grammar, llama_token toke
         throw std::runtime_error("Unexpected empty grammar stack after accepting piece: " + piece + " (" + std::to_string(token) + ")");
     }
 }
-

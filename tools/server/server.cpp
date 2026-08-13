@@ -17,6 +17,7 @@
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
+#include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -34,6 +35,47 @@ static inline void signal_handler(int signal) {
     }
 
     shutdown_handler(signal);
+}
+
+static std::vector<ggml_backend_dev_t> server_get_fit_devices(const common_params & params) {
+    std::vector<ggml_backend_dev_t> result;
+
+    if (!params.devices.empty()) {
+        for (auto * dev : params.devices) {
+            if (dev == nullptr) {
+                break;
+            }
+            result.push_back(dev);
+        }
+        return result;
+    }
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            result.push_back(dev);
+        }
+    }
+    return result;
+}
+
+static void server_apply_paged_memory_target(common_params & params) {
+    const auto devices = server_get_fit_devices(params);
+    const double reserve = 1.0 - params.paged_gpu_memory_utilization;
+
+    for (size_t i = 0; i < devices.size() && i < params.fit_params_target.size(); ++i) {
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(devices[i], &free, &total);
+        GGML_UNUSED(free);
+
+        if (total > 0) {
+            params.fit_params_target[i] = size_t(total * reserve);
+            SRV_INF("paged memory target: device=%s utilization=%.3f reserve=%.2f MiB\n",
+                    ggml_backend_dev_name(devices[i]), params.paged_gpu_memory_utilization,
+                    params.fit_params_target[i] / 1024.0 / 1024.0);
+        }
+    }
 }
 
 // satisfies -Wmissing-declarations (used by llama command)
@@ -148,7 +190,54 @@ int llama_server(common_params & params, int argc, char ** argv) {
             params.n_batch = params.n_ubatch;
         }
 
-        if (params.n_parallel < 0) {
+        const bool parallel_auto = params.n_parallel < 0;
+
+        if (params.scheduler == "paged") {
+            if (params.split_mode == LLAMA_SPLIT_MODE_ROW || params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                SRV_ERR("%s", "paged scheduler supports only split-mode layer or none\n");
+                return 1;
+            }
+
+            params.paged_kv = true;
+            params.kv_unified = true;
+            params.fit_params = true;
+            if (params.n_gpu_layers == -1) {
+                params.n_gpu_layers = -2;
+            }
+            if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+                SRV_WRN("%s", "paged scheduler requires Flash Attention; ignoring --flash-attn off\n");
+            }
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+
+            if (params.n_parallel_max == 0) {
+                params.n_parallel_max = parallel_auto ? 32 : params.n_parallel;
+            }
+            if (parallel_auto) {
+                params.n_parallel = params.n_parallel_max;
+            }
+            if (params.n_parallel > params.n_parallel_max) {
+                SRV_ERR("n_parallel (%d) exceeds max_num_seqs (%d)\n", params.n_parallel, params.n_parallel_max);
+                return 1;
+            }
+            params.ctx_shift = false;
+            if (!params.kv_prefix_cache) {
+                params.slot_prompt_similarity = 0.0f;
+            }
+            if (params.max_model_len <= 0 && params.n_ctx > 0) {
+                params.max_model_len = params.n_ctx;
+            }
+            if (params.max_model_len <= 0) {
+                SRV_ERR("%s", "paged scheduler requires --max-model-len or --ctx-size\n");
+                return 1;
+            }
+            params.fit_params_min_ctx = std::max(params.fit_params_min_ctx, params.max_model_len);
+            params.n_ctx = 0;
+            server_apply_paged_memory_target(params);
+
+            SRV_INF("paged scheduler enabled: block_size=%d max_model_len=%d max_num_seqs=%d admission=%s prefix_cache=%s\n",
+                    params.kv_block_size, params.max_model_len, params.n_parallel_max,
+                    params.paged_admission.c_str(), params.kv_prefix_cache ? "on" : "off");
+        } else if (params.n_parallel < 0) {
             SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
 
             params.n_parallel = 4;

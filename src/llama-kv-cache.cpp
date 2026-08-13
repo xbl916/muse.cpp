@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -363,6 +364,209 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+bool llama_kv_cache::configure_paged(uint32_t block_size, uint32_t max_seq_tokens) {
+    if (other || n_stream != 1 || v_trans || block_size == 0 || max_seq_tokens == 0 || (block_size & (block_size - 1)) != 0) {
+        return false;
+    }
+
+    paged = true;
+    paged_max_pages = (max_seq_tokens + block_size - 1) / block_size;
+    block_allocators.resize(n_stream);
+    for (uint32_t strm = 0; strm < n_stream; ++strm) {
+        block_allocators[strm].init(v_cells[strm].size(), block_size);
+    }
+    block_table.init(seq_to_stream.size());
+
+    paged_max_pages = std::min(paged_max_pages, block_allocators[0].n_blocks());
+
+    LLAMA_LOG_INFO("%s: enabled, block_size = %u, blocks = %u, max_pages_per_seq = %u\n",
+            __func__, block_size, block_allocators[0].n_blocks(), paged_max_pages);
+    return block_allocators[0].n_blocks() > 0;
+}
+
+uint32_t llama_kv_cache::get_n_free_blocks() const {
+    return paged && !block_allocators.empty() ? block_allocators[0].n_free() : 0;
+}
+
+void llama_kv_cache::paged_clear() {
+    if (!paged) {
+        return;
+    }
+    block_table.clear();
+    for (auto & allocator : block_allocators) {
+        allocator.reset();
+    }
+}
+
+void llama_kv_cache::paged_record_cell(
+        uint32_t strm, uint32_t cell, llama_seq_id seq_id, uint32_t logical_idx) {
+    if (!paged || strm >= block_allocators.size()) {
+        return;
+    }
+
+    auto & allocator = block_allocators[strm];
+    const uint32_t page = llama_kv_block_table::logical_page(logical_idx, allocator.block_size());
+    if (block_table.lookup(seq_id, page) == LLAMA_KV_BLOCK_ID_NONE) {
+        const uint32_t block = cell / allocator.block_size();
+        GGML_ASSERT(block < allocator.n_blocks());
+        GGML_ASSERT(allocator.acquire(block));
+        GGML_ASSERT(block_table.insert(seq_id, page, block));
+    }
+    GGML_ASSERT(block_table.set_n_tokens(seq_id, std::max(block_table.n_tokens(seq_id), logical_idx + 1)));
+}
+
+void llama_kv_cache::paged_release_seq(llama_seq_id seq_id) {
+    if (!paged) {
+        return;
+    }
+    if (seq_id < 0) {
+        for (llama_seq_id cur = 0; cur < (llama_seq_id) seq_to_stream.size(); ++cur) {
+            paged_release_seq(cur);
+        }
+        return;
+    }
+
+    const auto * pages_ptr = block_table.get(seq_id);
+    if (!pages_ptr) {
+        return;
+    }
+
+    const auto pages = *pages_ptr;
+    auto & allocator = block_allocators[seq_to_stream[seq_id]];
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    uint32_t n_tokens = 0;
+
+    for (uint32_t page = 0; page < pages.size(); ++page) {
+        const uint32_t block = pages[page];
+        if (block == LLAMA_KV_BLOCK_ID_NONE) {
+            continue;
+        }
+
+        bool live = false;
+        const auto & range = allocator.get(block);
+        for (uint32_t offset = 0; offset < range.size; ++offset) {
+            const uint32_t cell = range.cell(offset);
+            if (!cells.is_empty(cell) && cells.seq_has(cell, seq_id)) {
+                live = true;
+                n_tokens = std::max(n_tokens, page * range.size + offset + 1);
+            }
+        }
+
+        if (!live) {
+            block_table.erase_page(seq_id, page);
+            GGML_ASSERT(allocator.release(block));
+        }
+    }
+    GGML_ASSERT(block_table.set_n_tokens(seq_id, n_tokens));
+}
+
+void llama_kv_cache::paged_copy_seq(
+        llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) {
+    if (!paged || src < 0 || dst < 0) {
+        return;
+    }
+
+    auto & allocator = block_allocators[0];
+    const auto & cells = v_cells[seq_to_stream[src]];
+    const auto * src_pages_ptr = block_table.get(src);
+    if (!src_pages_ptr) {
+        return;
+    }
+
+    const auto src_pages = *src_pages_ptr;
+    std::vector<uint8_t> selected(src_pages.size(), 0);
+    for (uint32_t page = 0; page < src_pages.size(); ++page) {
+        const uint32_t block = src_pages[page];
+        if (block == LLAMA_KV_BLOCK_ID_NONE) {
+            continue;
+        }
+        const auto & range = allocator.get(block);
+        for (uint32_t offset = 0; offset < range.size; ++offset) {
+            const uint32_t cell = range.cell(offset);
+            if (!cells.is_empty(cell) && cells.seq_has(cell, src) && cells.pos_in(cell, p0, p1)) {
+                selected[page] = 1;
+                break;
+            }
+        }
+    }
+
+    if (const auto * dst_pages_ptr = block_table.get(dst)) {
+        const auto dst_pages = *dst_pages_ptr;
+        for (uint32_t page = 0; page < dst_pages.size() && page < selected.size(); ++page) {
+            if (!selected[page]) {
+                continue;
+            }
+            const uint32_t block = dst_pages[page];
+            if (block != LLAMA_KV_BLOCK_ID_NONE) {
+                block_table.erase_page(dst, page);
+                GGML_ASSERT(allocator.release(block));
+            }
+        }
+    }
+
+    for (uint32_t page = 0; page < src_pages.size(); ++page) {
+        const uint32_t block = src_pages[page];
+        if (selected[page] && block != LLAMA_KV_BLOCK_ID_NONE) {
+            GGML_ASSERT(allocator.retain(block));
+            GGML_ASSERT(block_table.insert(dst, page, block));
+        }
+    }
+    paged_release_seq(dst);
+}
+
+void llama_kv_cache::paged_copy_block(uint32_t strm, uint32_t src, uint32_t dst) {
+    const auto & allocator = block_allocators[strm];
+    const auto & src_block = allocator.get(src);
+    const auto & dst_block = allocator.get(dst);
+    GGML_ASSERT(src_block.size == dst_block.size);
+
+    for (const auto & layer : layers) {
+        for (ggml_tensor * tensor : { layer.k_stream[strm], layer.v_stream[strm] }) {
+            if (!tensor) {
+                continue;
+            }
+
+            const size_t row_size = tensor->nb[1];
+            const size_t n_bytes = src_block.size * row_size;
+            std::vector<uint8_t> staging(n_bytes);
+            ggml_backend_tensor_get(tensor, staging.data(), src_block.first_cell * row_size, n_bytes);
+            ggml_backend_tensor_set(tensor, staging.data(), dst_block.first_cell * row_size, n_bytes);
+        }
+    }
+}
+
+bool llama_kv_cache::paged_cow(const slot_info::cow_info & cow, bool copy_data) {
+    auto & allocator = block_allocators[cow.strm];
+    if (!allocator.acquire(cow.new_block)) {
+        return false;
+    }
+
+    if (copy_data) {
+        paged_copy_block(cow.strm, cow.old_block, cow.new_block);
+    }
+
+    auto & cells = v_cells[cow.strm];
+    const auto & old_block = allocator.get(cow.old_block);
+    const auto & new_block = allocator.get(cow.new_block);
+
+    for (uint32_t offset = 0; offset < old_block.size; ++offset) {
+        const uint32_t old_cell = old_block.cell(offset);
+        const uint32_t new_cell = new_block.cell(offset);
+        GGML_ASSERT(cells.is_empty(new_cell));
+
+        if (!cells.is_empty(old_cell) && cells.seq_has(old_cell, cow.seq_id)) {
+            cells.pos_set(new_cell, cells.pos_get(old_cell));
+            cells.ext_set(new_cell, cells.ext_get(old_cell));
+            cells.seq_add(new_cell, cow.seq_id);
+            cells.seq_rm(old_cell, cow.seq_id);
+        }
+    }
+
+    GGML_ASSERT(block_table.insert(cow.seq_id, cow.page, cow.new_block));
+    GGML_ASSERT(allocator.release(cow.old_block));
+    return true;
+}
+
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
@@ -374,6 +578,8 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+
+    paged_clear();
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -441,6 +647,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         }
     }
 
+    paged_release_seq(seq_id);
     return true;
 }
 
@@ -484,6 +691,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             }
         }
 
+        paged_copy_seq(seq_id_src, seq_id_dst, p0, p1);
         return;
     }
 
@@ -531,6 +739,8 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     v_heads[s1] = v_heads[s0];
 
+    paged_copy_seq(seq_id_src, seq_id_dst, p0, p1);
+
     //for (uint32_t s = 0; s < n_stream; ++s) {
     //    LLAMA_LOG_WARN("%s: seq %d: min = %d, max = %d\n", __func__, s, v_cells[s].seq_pos_min(s), v_cells[s].seq_pos_max(s));
     //}
@@ -560,6 +770,14 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
+    }
+
+    if (paged) {
+        for (llama_seq_id cur = 0; cur < (llama_seq_id) seq_to_stream.size(); ++cur) {
+            if (cur != seq_id) {
+                paged_release_seq(cur);
+            }
+        }
     }
 }
 
@@ -752,7 +970,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
 
+        std::vector<std::vector<uint32_t>> idxs;
         std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
+
+        std::vector<llama_kv_block_allocator> block_allocators;
+        llama_kv_block_table block_table;
     };
 
     // remember the old state of the cells so we can restore it in the end
@@ -773,19 +995,35 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // store the old state of the cells in the recovery stack
         {
-            state_t state = { sinfo_new, v_heads, {} };
+            state_t state = { sinfo_new, v_heads, {}, {}, block_allocators, block_table };
 
             for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
                 auto & cells = v_cells[sinfo_new.strm[s]];
 
-                state.v_cells.push_back(cells.cp(sinfo_new.idxs[s]));
+                auto idxs = sinfo_new.idxs[s];
+                for (const auto & cow : sinfo_new.cows) {
+                    if (cow.strm != (uint32_t) sinfo_new.strm[s]) {
+                        continue;
+                    }
+                    for (uint32_t block : { cow.old_block, cow.new_block }) {
+                        const auto & range = block_allocators[cow.strm].get(block);
+                        for (uint32_t offset = 0; offset < range.size; ++offset) {
+                            idxs.push_back(range.cell(offset));
+                        }
+                    }
+                }
+                std::sort(idxs.begin(), idxs.end());
+                idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
+
+                state.idxs.push_back(idxs);
+                state.v_cells.push_back(cells.cp(idxs));
             }
 
             states.push_back(std::move(state));
         }
 
         // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        apply_ubatch(sinfo_new, ubatch, false);
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -798,9 +1036,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             auto & cells = v_cells[sinfo.strm[s]];
             auto & head  = v_heads[sinfo.strm[s]];
 
-            cells.set(sinfo.idxs[s], it->v_cells[s]);
-            head = it->v_heads_old[s];
+            cells.set(it->idxs[s], it->v_cells[s]);
+            head = it->v_heads_old[sinfo.strm[s]];
         }
+
+        block_allocators = it->block_allocators;
+        block_table = it->block_table;
     }
 
     if (!success) {
@@ -974,6 +1215,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         /*.s1   =*/ 0,
         /*.strm =*/ { },
         /*.idxs =*/ { },
+        /*.lidxs=*/ { },
+        /*.cows =*/ { },
     };
 
     res.resize(n_seqs);
@@ -991,8 +1234,74 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         res.strm[s] = seq_to_stream[seq_id];
         res.idxs[s].reserve(n_tokens);
+        res.lidxs[s].reserve(n_tokens);
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
+
+        if (paged) {
+            const uint32_t strm = seq_to_stream[seq_id];
+            const auto & allocator = block_allocators[strm];
+            const uint32_t block_size = allocator.block_size();
+            std::unordered_map<uint64_t, uint32_t> planned;
+            std::unordered_map<uint64_t, uint32_t> planned_cow;
+            std::unordered_map<llama_seq_id, uint32_t> logical_next;
+            uint32_t n_planned = 0;
+
+            for (uint32_t ii = 0; ii < n_tokens; ++ii) {
+                const uint32_t i = s * n_tokens + ii;
+                const llama_seq_id token_seq = ubatch.seq_id[i][0];
+                const llama_pos pos = ubatch.pos[i];
+                if (pos < 0) {
+                    return {};
+                }
+
+                auto [it_next, inserted] = logical_next.emplace(token_seq, block_table.n_tokens(token_seq));
+                GGML_UNUSED(inserted);
+                const uint32_t logical_idx = it_next->second++;
+                const uint32_t page = llama_kv_block_table::logical_page(logical_idx, block_size);
+                const uint32_t offset = llama_kv_block_table::intra_offset(logical_idx, block_size);
+                if (page >= paged_max_pages) {
+                    return {};
+                }
+                const uint64_t key = (uint64_t(uint32_t(token_seq)) << 32) | page;
+
+                uint32_t block = block_table.lookup(token_seq, page);
+                if (block == LLAMA_KV_BLOCK_ID_NONE) {
+                    const auto it = planned.find(key);
+                    if (it != planned.end()) {
+                        block = it->second;
+                    } else {
+                        block = allocator.peek_free(n_planned++);
+                        if (block == LLAMA_KV_BLOCK_ID_NONE) {
+                            return {};
+                        }
+                        planned.emplace(key, block);
+                    }
+                } else if (allocator.is_shared(block)) {
+                    const auto it = planned_cow.find(key);
+                    if (it != planned_cow.end()) {
+                        block = it->second;
+                    } else {
+                        const uint32_t new_block = allocator.peek_free(n_planned++);
+                        if (new_block == LLAMA_KV_BLOCK_ID_NONE) {
+                            return {};
+                        }
+                        res.cows.push_back({ strm, token_seq, page, block, new_block });
+                        planned_cow.emplace(key, new_block);
+                        block = new_block;
+                    }
+                }
+
+                const uint32_t cell = allocator.get(block).cell(offset);
+                if (!cells.is_empty(cell) && !cells.seq_has(cell, token_seq)) {
+                    return {};
+                }
+                res.idxs[s].push_back(cell);
+                res.lidxs[s].push_back(logical_idx);
+            }
+
+            continue;
+        }
 
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
@@ -1090,7 +1399,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool copy_cow_data) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1104,6 +1413,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
+
+    for (const auto & cow : sinfo.cows) {
+        GGML_ASSERT(paged_cow(cow, copy_cow_data));
+    }
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
@@ -1134,8 +1447,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 cells.ext_set(idx, ext);
             }
 
-            for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
-                cells.seq_add(idx, ubatch.seq_id[i][s]);
+            for (int32_t q = 0; q < ubatch.n_seq_id[i]; q++) {
+                cells.seq_add(idx, ubatch.seq_id[i][q]);
+                paged_record_cell(sinfo.strm[s], idx, ubatch.seq_id[i][q], sinfo.lidxs[s][ii]);
             }
         }
     }
@@ -1169,6 +1483,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    if (paged) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -1187,6 +1504,10 @@ uint32_t llama_kv_cache::get_size() const {
 
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
+}
+
+uint32_t llama_kv_cache::get_block_table_max_mapped_page_plus1() const {
+    return std::max(1u, block_table.max_mapped_page_plus1());
 }
 
 bool llama_kv_cache::get_has_shift() const {
@@ -1413,6 +1734,112 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     ggml_set_input(v_idxs);
 
     return v_idxs;
+}
+
+ggml_tensor * llama_kv_cache::build_input_block_table(ggml_context * ctx) const {
+    if (!paged) {
+        return nullptr;
+    }
+
+    ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, paged_max_pages, n_seq_max);
+    ggml_set_input(result);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache::build_input_seq_ids_q(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    if (!paged) {
+        return nullptr;
+    }
+
+    ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ubatch.n_tokens);
+    ggml_set_input(result);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache::build_input_page_limits_q(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    if (!paged) {
+        return nullptr;
+    }
+
+    ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, ubatch.n_tokens);
+    ggml_set_input(result);
+    return result;
+}
+
+void llama_kv_cache::set_input_block_table(ggml_tensor * dst) const {
+    if (!paged || !dst) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    const uint32_t max_pages = dst->ne[0];
+    const uint32_t n_seqs = dst->ne[1];
+    int32_t * data = (int32_t *) dst->data;
+
+    for (uint32_t seq_id = 0; seq_id < n_seqs; ++seq_id) {
+        int32_t * row = data + size_t(seq_id) * max_pages;
+        std::fill(row, row + max_pages, -1);
+
+        const auto * pages = block_table.get(seq_id);
+        if (!pages) {
+            continue;
+        }
+        for (uint32_t page = 0; page < pages->size() && page < max_pages; ++page) {
+            const uint32_t block = (*pages)[page];
+            if (block != LLAMA_KV_BLOCK_ID_NONE) {
+                row[page] = block;
+            }
+        }
+    }
+
+}
+
+void llama_kv_cache::set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (!paged || !dst || !ubatch) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->ne[0] == ubatch->n_tokens);
+
+    int32_t * data = (int32_t *) dst->data;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        GGML_ASSERT(ubatch->n_seq_id[i] > 0);
+        data[i] = ubatch->seq_id[i][0];
+    }
+}
+
+void llama_kv_cache::set_input_page_limits_q(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
+    if (!paged || !dst || !ubatch) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->ne[0] == 2 && dst->ne[1] == ubatch->n_tokens);
+
+    const uint32_t block_size = block_allocators[0].block_size();
+    const uint32_t n_tps = ubatch->n_tokens / sinfo.n_stream();
+    int32_t * data = (int32_t *) dst->data;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        GGML_ASSERT(ubatch->pos[i] >= 0);
+        const uint32_t strm = i / n_tps;
+        const uint32_t logical_idx = sinfo.lidxs[strm][i % n_tps];
+        int32_t page_start = 0;
+        const int32_t page_end = llama_kv_block_table::logical_page(logical_idx, block_size) + 1;
+
+        if (!ubatch->is_pos_2d() && swa_type != LLAMA_SWA_TYPE_NONE && n_swa > 0) {
+            if (logical_idx >= n_swa) {
+                page_start = llama_kv_block_table::logical_page(logical_idx - n_swa + 1, block_size);
+            }
+        }
+
+        data[2*i + 0] = std::min(page_start, page_end);
+        data[2*i + 1] = page_end;
+    }
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
@@ -2518,9 +2945,11 @@ llama_kv_cache_context::llama_kv_cache_context(
     sinfos[0].s0 = 0;
     sinfos[0].s1 = n_stream - 1;
     sinfos[0].idxs.resize(n_stream);
+    sinfos[0].lidxs.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
         sinfos[0].strm.push_back(s);
         sinfos[0].idxs[s].resize(1, 0);
+        sinfos[0].lidxs[s].resize(1, 0);
     }
 }
 
@@ -2568,6 +2997,10 @@ bool llama_kv_cache_context::apply() {
     return true;
 }
 
+bool llama_kv_cache_context::requires_synchronize() const {
+    return !ubatches.empty() && !sinfos[i_cur].cows.empty();
+}
+
 llama_memory_status llama_kv_cache_context::get_status() const {
     return status;
 }
@@ -2580,6 +3013,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_context::get_block_table_max_mapped_page_plus1() const {
+    return kv->get_block_table_max_mapped_page_plus1();
 }
 
 ggml_type llama_kv_cache_context::type_k() const {
@@ -2614,6 +3051,18 @@ ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, con
     return kv->build_input_v_idxs(ctx, ubatch);
 }
 
+ggml_tensor * llama_kv_cache_context::build_input_block_table(ggml_context * ctx) const {
+    return kv->build_input_block_table(ctx);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_seq_ids_q(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_seq_ids_q(ctx, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_page_limits_q(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_page_limits_q(ctx, ubatch);
+}
+
 ggml_tensor * llama_kv_cache_context::build_input_k_rot(ggml_context * ctx) const {
     return kv->build_input_k_rot(ctx);
 }
@@ -2632,6 +3081,18 @@ void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_block_table(ggml_tensor * dst) const {
+    kv->set_input_block_table(dst);
+}
+
+void llama_kv_cache_context::set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_seq_ids_q(dst, ubatch);
+}
+
+void llama_kv_cache_context::set_input_page_limits_q(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_page_limits_q(dst, ubatch, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {

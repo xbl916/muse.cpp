@@ -350,6 +350,8 @@ extern "C" {
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
         uint32_t n_ctx;                 // text context, 0 = from model
+        uint32_t n_ctx_seq;             // maximum context for one sequence, 0 = derived from n_ctx
+        uint32_t kv_block_size;          // paged KV block size in tokens
         uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;              // physical maximum batch size
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
@@ -398,6 +400,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool paged_kv;    // use block-table-managed KV allocation
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -794,6 +797,9 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    // Returns zero if the memory does not use paged KV.
+    LLAMA_API uint32_t llama_memory_n_free_blocks(llama_memory_t mem);
 
     //
     // State / sessions

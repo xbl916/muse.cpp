@@ -2437,6 +2437,22 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    GGML_API void ggml_flash_attn_ext_set_block_table(
+            struct ggml_tensor * a,
+            struct ggml_tensor * block_table);
+
+    GGML_API void ggml_flash_attn_ext_set_seq_ids_q(
+            struct ggml_tensor * a,
+            struct ggml_tensor * seq_ids_q);
+
+    GGML_API void ggml_flash_attn_ext_set_page_limits_q(
+            struct ggml_tensor * a,
+            struct ggml_tensor * page_limits_q);
+
+    GGML_API void ggml_flash_attn_ext_set_block_size(
+            struct ggml_tensor * a,
+            int32_t              block_size);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

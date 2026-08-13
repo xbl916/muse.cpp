@@ -5479,6 +5479,42 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_block_table(
+        struct ggml_tensor * a,
+        struct ggml_tensor * block_table) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(!block_table || block_table->type == GGML_TYPE_I32);
+
+    a->src[5] = block_table;
+}
+
+void ggml_flash_attn_ext_set_seq_ids_q(
+        struct ggml_tensor * a,
+        struct ggml_tensor * seq_ids_q) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(!seq_ids_q || seq_ids_q->type == GGML_TYPE_I32);
+
+    a->src[6] = seq_ids_q;
+}
+
+void ggml_flash_attn_ext_set_page_limits_q(
+        struct ggml_tensor * a,
+        struct ggml_tensor * page_limits_q) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(!page_limits_q || page_limits_q->type == GGML_TYPE_I32);
+
+    a->src[7] = page_limits_q;
+}
+
+void ggml_flash_attn_ext_set_block_size(
+        struct ggml_tensor * a,
+        int32_t              block_size) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(block_size > 0 && (block_size & (block_size - 1)) == 0);
+
+    ggml_set_op_params_i32(a, 4, block_size);
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

@@ -271,6 +271,8 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.paged_kv = params.paged_kv;
+    cparams.kv_block_size = params.kv_block_size;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -288,7 +290,10 @@ llama_context::llama_context(
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
     if (cparams.kv_unified) {
-        cparams.n_ctx_seq = cparams.n_ctx;
+        cparams.n_ctx_seq = params.n_ctx_seq == 0 ? cparams.n_ctx : GGML_PAD(params.n_ctx_seq, 256);
+        if (cparams.n_ctx_seq == 0 || cparams.n_ctx_seq > cparams.n_ctx) {
+            throw std::runtime_error(format("invalid n_ctx_seq %u for n_ctx %u", cparams.n_ctx_seq, cparams.n_ctx));
+        }
     } else {
         cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
         cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
@@ -393,6 +398,10 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (cparams.paged_kv && (!memory || !memory->configure_paged(cparams.kv_block_size, cparams.n_ctx_seq))) {
+            throw std::runtime_error("paged KV is not supported by this model memory type");
+        }
     }
 
     // init backends
@@ -1323,6 +1332,9 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (mctx && mctx->requires_synchronize()) {
+        synchronize();
+    }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -3508,6 +3520,8 @@ void llama_context::opt_epoch(
 llama_context_params llama_context_default_params() {
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
+        /*.n_ctx_seq                   =*/ 0,
+        /*.kv_block_size               =*/ 32,
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
@@ -3541,6 +3555,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.paged_kv                    =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -3564,6 +3579,11 @@ llama_context * llama_init_from_model(
 
     if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
+        return nullptr;
+    }
+
+    if (params.kv_block_size == 0 || (params.kv_block_size & (params.kv_block_size - 1)) != 0) {
+        LLAMA_LOG_ERROR("%s: kv_block_size must be a positive power of two\n", __func__);
         return nullptr;
     }
 
@@ -3993,6 +4013,10 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+uint32_t llama_memory_n_free_blocks(llama_memory_t mem) {
+    return mem ? mem->get_n_free_blocks() : 0;
 }
 
 // llama state API

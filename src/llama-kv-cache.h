@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-memory.h"
 
 #include <unordered_map>
@@ -41,6 +42,17 @@ public:
 
         std::vector<llama_seq_id> strm; // [ns]
         std::vector<idx_vec_t>    idxs; // [ns]
+        std::vector<idx_vec_t>   lidxs; // [ns]
+
+        struct cow_info {
+            uint32_t strm;
+            llama_seq_id seq_id;
+            uint32_t page;
+            uint32_t old_block;
+            uint32_t new_block;
+        };
+
+        std::vector<cow_info> cows;
 
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
@@ -52,6 +64,7 @@ public:
         void resize(size_t n) {
             strm.resize(n);
             idxs.resize(n);
+            lidxs.resize(n);
         }
 
         size_t size() const {
@@ -71,6 +84,7 @@ public:
 
         void clear() {
             idxs.clear();
+            lidxs.clear();
         }
 
         // check if indices are contiguous starting from head()
@@ -131,6 +145,9 @@ public:
 
     bool get_can_shift() const override;
 
+    bool configure_paged(uint32_t block_size, uint32_t max_seq_tokens) override;
+    uint32_t get_n_free_blocks() const override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -155,6 +172,7 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
+    uint32_t get_block_table_max_mapped_page_plus1() const;
 
     bool get_has_shift() const;
 
@@ -196,7 +214,7 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool copy_cow_data = true);
 
     //
     // input API
@@ -204,12 +222,18 @@ public:
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_block_table(ggml_context * ctx) const;
+    ggml_tensor * build_input_seq_ids_q(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_page_limits_q(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+    void set_input_block_table(ggml_tensor * dst) const;
+    void set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_page_limits_q(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
@@ -286,6 +310,11 @@ private:
 
     std::vector<kv_layer> layers;
 
+    bool paged = false;
+    uint32_t paged_max_pages = 0;
+    std::vector<llama_kv_block_allocator> block_allocators;
+    llama_kv_block_table block_table;
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
@@ -293,6 +322,13 @@ private:
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
+
+    void paged_clear();
+    void paged_record_cell(uint32_t strm, uint32_t cell, llama_seq_id seq_id, uint32_t logical_idx);
+    void paged_release_seq(llama_seq_id seq_id);
+    void paged_copy_seq(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1);
+    bool paged_cow(const slot_info::cow_info & cow, bool copy_data);
+    void paged_copy_block(uint32_t strm, uint32_t src, uint32_t dst);
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
@@ -356,6 +392,7 @@ public:
 
     bool next()  override;
     bool apply() override;
+    bool requires_synchronize() const override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -365,6 +402,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_block_table_max_mapped_page_plus1() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -387,12 +425,18 @@ public:
     //   helps understand the implementation logic of cpy_k and cpy_v
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_block_table(ggml_context * ctx) const;
+    ggml_tensor * build_input_seq_ids_q(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_page_limits_q(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_block_table(ggml_tensor * dst) const;
+    void set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_page_limits_q(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;

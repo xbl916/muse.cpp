@@ -58,6 +58,9 @@ public:
 
     bool get_can_shift() const override;
 
+    bool configure_paged(uint32_t block_size, uint32_t max_seq_tokens) override;
+    uint32_t get_n_free_blocks() const override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -116,6 +119,7 @@ public:
 
     bool next()  override;
     bool apply() override;
+    bool requires_synchronize() const override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

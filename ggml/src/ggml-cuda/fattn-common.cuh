@@ -39,7 +39,12 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const int * __restrict__ block_table,
+        const int * __restrict__ seq_ids_q,
+        const int * __restrict__ page_limits_q,
+        const int32_t max_pages,
+        const int32_t block_size);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -985,6 +990,16 @@ void launch_fattn(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
+    const ggml_tensor * block_table_t = dst->src[5];
+    const ggml_tensor * seq_ids_q_t = dst->src[6];
+    const ggml_tensor * page_limits_q_t = dst->src[7];
+
+    const int * block_table = block_table_t ? (const int *) block_table_t->data : nullptr;
+    const int * seq_ids_q = seq_ids_q_t ? (const int *) seq_ids_q_t->data : nullptr;
+    const int * page_limits_q = page_limits_q_t ? (const int *) page_limits_q_t->data : nullptr;
+    const int32_t max_pages = block_table_t ? block_table_t->ne[0] : 0;
+    const int32_t block_size = block_table_t ? ggml_get_op_params_i32(dst, 4) : 0;
+
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
@@ -1221,7 +1236,8 @@ void launch_fattn(
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        block_table, seq_ids_q, page_limits_q, max_pages, block_size
     );
     CUDA_CHECK(cudaGetLastError());
 

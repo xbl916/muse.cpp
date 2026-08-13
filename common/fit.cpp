@@ -230,7 +230,6 @@ static void common_params_fit_impl(
     int64_t sum_projected_model = 0;
     std::vector<int64_t> projected_free_per_device;
     projected_free_per_device.reserve(nd);
-
     if (nd == 0) {
         sum_projected_used = dmds_full.back().mb.total();
         sum_free           = dmds_full.back().total;
@@ -788,6 +787,68 @@ static void common_params_fit_impl(
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 
+static void common_expand_paged_context(
+        const char * path_model,
+        llama_model_params * mparams,
+        llama_context_params * cparams,
+        size_t * margins,
+        ggml_log_level log_level) {
+    const uint32_t n_ctx_ref = cparams->n_ctx;
+    const uint32_t probe_tokens = std::max<uint32_t>(1024, cparams->kv_block_size);
+    if (n_ctx_ref > UINT32_MAX - probe_tokens) {
+        return;
+    }
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_nct = 0;
+    uint32_t hp_nex = 0;
+    const std::vector<llama_device_memory_data> dmds_ref = common_get_device_memory_data_impl(
+            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+    llama_context_params cparams_probe = *cparams;
+    cparams_probe.n_ctx += probe_tokens;
+    const std::vector<llama_device_memory_data> dmds_probe = common_get_device_memory_data_impl(
+            path_model, mparams, &cparams_probe, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+    int64_t extra_tokens = INT64_MAX;
+    bool has_device_kv = false;
+    for (size_t id = 0; id < devs.size(); ++id) {
+        const int64_t probe_growth = dmds_probe[id].mb.total() - dmds_ref[id].mb.total();
+        if (probe_growth <= 0) {
+            continue;
+        }
+
+        has_device_kv = true;
+        const int64_t available = int64_t(dmds_ref[id].free) - int64_t(dmds_ref[id].mb.total()) - int64_t(margins[id]);
+        const int64_t fit = available > 0 ? available * probe_tokens / probe_growth : 0;
+        extra_tokens = std::min(extra_tokens, fit);
+
+        LOG_INF("%s: device %s KV growth=%" PRId64 " KiB/%u tokens, room=%" PRId64 " tokens\n",
+                __func__, ggml_backend_dev_name(devs[id]), probe_growth / 1024, probe_tokens, fit);
+    }
+
+    if (!has_device_kv || extra_tokens <= 0) {
+        LOG_WRN("%s: no device memory available for paged KV expansion\n", __func__);
+        return;
+    }
+
+    extra_tokens = extra_tokens * 85 / 100;
+    uint64_t expanded = uint64_t(n_ctx_ref) + uint64_t(extra_tokens);
+    if (cparams->n_ctx_seq > 0 && cparams->n_seq_max > 0) {
+        expanded = std::min(expanded, uint64_t(cparams->n_ctx_seq) * cparams->n_seq_max);
+    }
+    expanded = std::min<uint64_t>(expanded, UINT32_MAX);
+
+    const uint32_t alignment = std::max<uint32_t>(256, cparams->kv_block_size);
+    cparams->n_ctx = uint32_t(expanded);
+    cparams->n_ctx -= cparams->n_ctx % alignment;
+    cparams->n_ctx = std::max(cparams->n_ctx, n_ctx_ref);
+
+    LOG_INF("%s: paged KV pool context=%u tokens, per-sequence max=%u, safety=0.85\n",
+            __func__, cparams->n_ctx, cparams->n_ctx_seq);
+}
+
 enum common_params_fit_status common_fit_params(
         const char * path_model,
         llama_model_params * mparams,
@@ -800,7 +861,14 @@ enum common_params_fit_status common_fit_params(
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
+        const bool expand_paged_ctx = cparams->paged_kv && cparams->n_ctx == 0 && n_ctx_min != UINT32_MAX;
+        if (expand_paged_ctx) {
+            cparams->n_ctx = n_ctx_min;
+        }
         common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, log_level);
+        if (expand_paged_ctx) {
+            common_expand_paged_context(path_model, mparams, cparams, margins, log_level);
+        }
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
