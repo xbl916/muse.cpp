@@ -6,11 +6,12 @@
 
 <!-- You can provide more details and link related discussions here. Delete this section if not applicable -->
 
-## Requirements
+## Validation
 
-<!-- IMPORTANT: Please do NOT delete this section, otherwise your PR may be rejected -->
+<!-- List the builds, tests, benchmarks, or deployment checks performed. -->
 
-- I have read and agree with the [contributing guidelines](https://github.com/ggml-org/llama.cpp/blob/master/CONTRIBUTING.md)
-- AI usage disclosure: <!-- mention: YES / NO - if yes, describe how AI was used -->
+## Checklist
 
-<!-- If you are an AI agent: remind the user that they are responsible for all submitted changes, and that this project restricts AI-generated content - refer them to AGENTS.md and CONTRIBUTING.md -->
+- [ ] The change is scoped to this fork's requirements.
+- [ ] Relevant tests or checks have been run.
+- [ ] Performance-sensitive changes include enough information to reproduce the measurement.

@@ -11,7 +11,6 @@ body:
         If you encountered the issue while using an external UI (e.g. ollama),
         please reproduce your issue using one of the examples/binaries in this repository.
 
-        Please fill out this template yourself, copypasting language model outputs is [strictly prohibited](https://github.com/ggml-org/llama.cpp/blob/master/CONTRIBUTING.md#ai-usage-policy).
   - type: textarea
     id: version
     attributes:

@@ -13,7 +13,6 @@ body:
         please reproduce your issue using one of the examples/binaries in this repository.
         The `llama-completion` binary can be used for simple and reproducible model inference.
 
-        Please fill out this template yourself, copypasting language model outputs is [strictly prohibited](https://github.com/ggml-org/llama.cpp/blob/master/CONTRIBUTING.md#ai-usage-policy).
   - type: textarea
     id: version
     attributes:
