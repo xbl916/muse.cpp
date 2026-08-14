@@ -23,6 +23,8 @@
 #include <string>
 #include <unordered_set>
 
+static constexpr int32_t GGML_TENSOR_FLAG_META_LOCAL_TOP_K_INTERNAL = 64;
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -1267,6 +1269,11 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 }
 
 void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
+    if (candidate_offsets && candidate_offsets->buffer) {
+        ggml_backend_tensor_set(candidate_offsets, candidate_offsets_data.data(), 0,
+                candidate_offsets_data.size() * sizeof(candidate_offsets_data[0]));
+    }
+
     // set the inputs only for the active samplers in the current ubatch
     std::unordered_set<llama_seq_id> active_samplers;
     for (uint32_t i = 0; i < ubatch->n_tokens; i++) {
@@ -1489,6 +1496,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
+    tensor_split     (params.tensor_split),
+    tensor_split_devices(params.tensor_split_devices),
+    tensor_split_equal(params.tensor_split_equal),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -3693,6 +3703,7 @@ void llm_graph_context::build_sampling() const {
     outs[0] = res->t_logits;
 
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
+    auto * inp_sampling_ptr = inp_sampling.get();
     res->add_input(std::move(inp_sampling));
 
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
@@ -3711,15 +3722,100 @@ void llm_graph_context::build_sampling() const {
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
 
-    // add a dummy row to keep the single-output graph static regardless of active samplers
-    // multi-output graphs can still vary with the number of output rows
-    ggml_tensor * logits_t = ggml_pad(ctx0, res->t_logits, 0, 1, 0, 0);
+    ggml_tensor * sampling_logits = res->t_logits;
 
     for (const auto & entry : samplers) {
         if (entry.second->iface->backend_reset) {
             entry.second->iface->backend_reset(entry.second);
         }
     }
+
+    // A top-k over all active rows is substantially cheaper than launching one
+    // full-vocabulary top-k graph per slot. Sparse penalties can be applied after
+    // an enlarged prefilter without changing the result when they only lower logits.
+    int32_t batch_prefilter_k = 0;
+    bool batch_prefilter = n_rows > 1 ||
+            (n_rows > 0 && tensor_split && tensor_split_devices > 1);
+
+    if (batch_prefilter) {
+        for (const auto & [seq_id, sampler] : samplers) {
+            const auto it = sampling_rows.find(seq_id);
+            if (it == sampling_rows.end() && n_rows > 1) {
+                continue;
+            }
+
+            const int32_t sampler_k = llama_sampler_backend_batch_prefilter_k(sampler);
+            if (sampler_k <= 0) {
+                batch_prefilter = false;
+                break;
+            }
+            batch_prefilter_k = std::max(batch_prefilter_k, sampler_k);
+        }
+    }
+
+    const bool distributed_prefilter = batch_prefilter && tensor_split && tensor_split_devices > 1 && tensor_split_equal;
+
+    if (tensor_split && !distributed_prefilter) {
+        sampling_logits = ggml_dup(ctx0, sampling_logits);
+        sampling_logits->flags |= GGML_TENSOR_FLAG_META_GATHER;
+        ggml_set_name(sampling_logits, "sampling_logits_gathered");
+    }
+
+    ggml_tensor * batched_candidates = nullptr;
+    ggml_tensor * distributed_packed_candidates = nullptr;
+    int32_t batch_candidates_per_row = batch_prefilter_k;
+    if (batch_prefilter) {
+        const int64_t prefilter_limit = distributed_prefilter ?
+                sampling_logits->ne[0] / tensor_split_devices : sampling_logits->ne[0];
+        batch_prefilter_k = std::min<int32_t>(batch_prefilter_k, prefilter_limit);
+        batch_candidates_per_row = distributed_prefilter ?
+                batch_prefilter_k * tensor_split_devices : batch_prefilter_k;
+        batched_candidates = ggml_top_k(ctx0, sampling_logits, batch_candidates_per_row);
+        if (distributed_prefilter) {
+            batched_candidates->flags |= GGML_TENSOR_FLAG_META_LOCAL_TOP_K_INTERNAL;
+            ggml_set_name(batched_candidates, "sampling_sharded_batched_top_k");
+
+            inp_sampling_ptr->candidate_offsets = ggml_new_tensor_1d(
+                    ctx0, GGML_TYPE_F32, batch_candidates_per_row);
+            ggml_set_name(inp_sampling_ptr->candidate_offsets, "sampling_candidate_offsets");
+            ggml_set_input(inp_sampling_ptr->candidate_offsets);
+            inp_sampling_ptr->candidate_offsets_data.resize(batch_candidates_per_row);
+
+            const int64_t n_vocab = sampling_logits->ne[0];
+            for (uint32_t dev = 0; dev < tensor_split_devices; ++dev) {
+                const float offset = float(n_vocab * dev / tensor_split_devices);
+                std::fill_n(inp_sampling_ptr->candidate_offsets_data.begin() + dev * batch_prefilter_k,
+                        batch_prefilter_k, offset);
+            }
+
+            ggml_tensor * local_logits_matrix = nullptr;
+            for (uint32_t row = 0; row < n_rows; ++row) {
+                ggml_tensor * row_candidates = ggml_view_1d(ctx0, batched_candidates,
+                        batch_candidates_per_row, row * batched_candidates->nb[1]);
+                ggml_tensor * row_logits = ggml_view_1d(ctx0, sampling_logits,
+                        sampling_logits->ne[0], row * sampling_logits->nb[1]);
+                row_logits = ggml_reshape_2d(ctx0, row_logits, 1, row_logits->ne[0]);
+                row_logits = ggml_get_rows(ctx0, row_logits, row_candidates);
+                row_logits = ggml_reshape_2d(ctx0, row_logits, batch_candidates_per_row, 1);
+
+                local_logits_matrix = local_logits_matrix ?
+                        ggml_concat(ctx0, local_logits_matrix, row_logits, 1) : row_logits;
+            }
+
+            ggml_tensor * candidates_f32 = ggml_cast(ctx0, batched_candidates, GGML_TYPE_F32);
+            distributed_packed_candidates = ggml_concat(
+                    ctx0, local_logits_matrix, candidates_f32, 1);
+            distributed_packed_candidates = ggml_dup(ctx0, distributed_packed_candidates);
+            distributed_packed_candidates->flags |= GGML_TENSOR_FLAG_META_GATHER;
+            ggml_set_name(distributed_packed_candidates, "sampling_sharded_candidates_gathered");
+        } else {
+            ggml_set_name(batched_candidates, "sampling_batched_top_k");
+        }
+    }
+
+    // add a dummy row to keep the single-output graph static regardless of active samplers
+    // multi-output graphs can still vary with the number of output rows
+    ggml_tensor * logits_t = ggml_pad(ctx0, sampling_logits, 0, 1, 0, 0);
 
     static const std::vector<uint32_t> dummy_row = { 0 };
 
@@ -3728,6 +3824,9 @@ void llm_graph_context::build_sampling() const {
 
         // inactive samplers always work on the first row
         const bool active = it != sampling_rows.end();
+        if (batch_prefilter && !active && n_rows > 1) {
+            continue;
+        }
         const auto & rows = active ? it->second : dummy_row;
         const int i_out   = active ? 1          : 0;
 
@@ -3735,11 +3834,36 @@ void llm_graph_context::build_sampling() const {
             ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], rows[i] * logits_t->nb[1]);
             ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
 
+            ggml_tensor * candidates_seq = nullptr;
+            if (batch_prefilter) {
+                if (distributed_prefilter) {
+                    logits_seq = ggml_view_1d(ctx0, distributed_packed_candidates,
+                            batch_candidates_per_row,
+                            rows[i] * distributed_packed_candidates->nb[1]);
+                    candidates_seq = ggml_view_1d(ctx0, distributed_packed_candidates,
+                            batch_candidates_per_row,
+                            (n_rows + rows[i]) * distributed_packed_candidates->nb[1]);
+                    candidates_seq = ggml_add(ctx0, candidates_seq, inp_sampling_ptr->candidate_offsets);
+                    candidates_seq = ggml_cast(ctx0, candidates_seq, GGML_TYPE_I32);
+                    ggml_format_name(candidates_seq, "global_candidates_seq_%d_%u", seq_id, i);
+                    ggml_format_name(logits_seq, "gathered_logits_seq_%d_%u", seq_id, i);
+                } else {
+                    candidates_seq = ggml_view_1d(ctx0, batched_candidates, batch_candidates_per_row,
+                            rows[i] * batched_candidates->nb[1]);
+                    ggml_format_name(candidates_seq, "batched_candidates_seq_%d_%u", seq_id, i);
+
+                    ggml_tensor * logits_rows = ggml_reshape_2d(ctx0, logits_seq, 1, logits_seq->ne[0]);
+                    logits_seq = ggml_get_rows(ctx0, logits_rows, candidates_seq);
+                    logits_seq = ggml_reshape_1d(ctx0, logits_seq, batch_candidates_per_row);
+                    ggml_format_name(logits_seq, "batched_logits_seq_%d_%u", seq_id, i);
+                }
+            }
+
             struct llama_sampler_data data = {
                 /*.logits       =*/ logits_seq,
                 /*.probs        =*/ nullptr,
                 /*.sampled      =*/ nullptr,
-                /*.candidates   =*/ nullptr,
+                /*.candidates   =*/ candidates_seq,
             };
 
             assert(sampler->iface->backend_apply);

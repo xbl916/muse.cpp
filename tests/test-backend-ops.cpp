@@ -9453,6 +9453,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2048, 2, 1, 3}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 3}, k));
     }
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 8, 1, 1}, 84));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {

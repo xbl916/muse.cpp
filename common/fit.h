@@ -54,3 +54,10 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);
+
+uint32_t common_paged_kv_expand_after_load(
+                     const llama_context * ctx,
+    const std::vector<ggml_backend_dev_t> & devices,
+               const std::vector<size_t> & margins,
+                                  uint32_t   max_tokens,
+                                  uint32_t   alignment);

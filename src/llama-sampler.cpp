@@ -1489,6 +1489,7 @@ static void llama_sampler_top_k_backend_apply(
     if (data->candidates) {
         struct ggml_tensor * candidates_rows = ggml_reshape_2d(ctx, data->candidates, 1, data->candidates->ne[0]);
         data->candidates = ggml_get_rows(ctx, candidates_rows, top_k);
+        data->candidates = ggml_reshape_1d(ctx, data->candidates, ggml_nelements(data->candidates));
         ggml_set_name(data->candidates, "top_k_candidates");
     } else {
         data->candidates = top_k;
@@ -2954,26 +2955,40 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         return;
     }
 
-    // Apply frequency and presence penalties to the cur_p
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
-        if (token_iter == ctx->token_count.end()) {
-            continue;
-        }
-
-        const int count = token_iter->second;
-
+    auto apply = [&](llama_token_data & candidate, int count) {
         assert(count > 0 && count <= ctx->penalty_last_n);
 
-        // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
-        // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (cur_p->data[i].logit <= 0) {
-            cur_p->data[i].logit *= ctx->penalty_repeat;
+        if (candidate.logit <= 0) {
+            candidate.logit *= ctx->penalty_repeat;
         } else {
-            cur_p->data[i].logit /= ctx->penalty_repeat;
+            candidate.logit /= ctx->penalty_repeat;
         }
 
-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        candidate.logit -= float(count) * ctx->penalty_freq + ctx->penalty_present;
+    };
+
+    bool direct = !cur_p->sorted && cur_p->size == (size_t) ctx->n_vocab;
+    if (direct) {
+        for (const auto & [token, count] : ctx->token_count) {
+            GGML_UNUSED(count);
+            if (token < 0 || (size_t) token >= cur_p->size || cur_p->data[token].id != token) {
+                direct = false;
+                break;
+            }
+        }
+    }
+
+    if (direct) {
+        for (const auto & [token, count] : ctx->token_count) {
+            apply(cur_p->data[token], count);
+        }
+    } else {
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
+            if (token_iter != ctx->token_count.end()) {
+                apply(cur_p->data[i], token_iter->second);
+            }
+        }
     }
 
     cur_p->sorted = false;
@@ -3199,6 +3214,52 @@ static struct llama_sampler_i llama_sampler_penalties_i = {
     /* .backend_reset     = */ llama_sampler_penalties_backend_reset,
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_penalties>,
 };
+
+int32_t llama_sampler_backend_batch_prefilter_k(const llama_sampler * sampler) {
+    if (!sampler || sampler->iface != &llama_sampler_chain_i) {
+        return 0;
+    }
+
+    const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+    if (!chain->is_init) {
+        return 0;
+    }
+
+    int32_t extra_candidates = 0;
+
+    for (const auto & entry : chain->samplers) {
+        if (!entry.is_backend) {
+            return 0;
+        }
+
+        if (entry.ptr->iface == &llama_sampler_empty_i) {
+            continue;
+        }
+
+        if (entry.ptr->iface == &llama_sampler_penalties_i) {
+            const auto * penalties = (const llama_sampler_penalties *) entry.ptr->ctx;
+
+            // Moving top-k before penalties is exact when penalties can only lower
+            // logits. At most one replacement is needed per distinct history token.
+            if (penalties->penalty_repeat < 1.0f ||
+                    penalties->penalty_freq < 0.0f || penalties->penalty_present < 0.0f) {
+                return 0;
+            }
+
+            extra_candidates += std::min(penalties->penalty_last_n, penalties->n_vocab);
+            continue;
+        }
+
+        if (entry.ptr->iface == &llama_sampler_top_k_i) {
+            const auto * top_k = (const llama_sampler_top_k *) entry.ptr->ctx;
+            return std::min<int32_t>(top_k->k + extra_candidates, INT32_MAX);
+        }
+
+        return 0;
+    }
+
+    return 0;
+}
 
 struct llama_sampler * llama_sampler_init_penalties(
         int32_t n_vocab,

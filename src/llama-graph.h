@@ -724,6 +724,9 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    ggml_tensor * candidate_offsets = nullptr;
+    std::vector<float> candidate_offsets_data;
 };
 
 //
@@ -760,6 +763,10 @@ struct llm_graph_params {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    bool tensor_split = false;
+    uint32_t tensor_split_devices = 0;
+    bool tensor_split_equal = false;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -1000,6 +1007,10 @@ struct llm_graph_context {
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const bool tensor_split;
+    const uint32_t tensor_split_devices;
+    const bool tensor_split_equal;
 
     const llm_graph_cb & cb_func;
 

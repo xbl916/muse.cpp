@@ -254,9 +254,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
             params.n_ctx = 0;
             server_apply_paged_memory_target(params);
 
-            SRV_INF("paged scheduler enabled: block_size=%d max_model_len=%d max_num_seqs=%d admission=%s prefix_cache=%s prefill_chunk=%d\n",
+            SRV_INF("paged scheduler enabled: block_size=%d max_model_len=%d max_num_seqs=%d admission=%s prefix_cache=%s prefill_chunk=%d prefill_target=%.1f ms decode_steps=%d\n",
                     params.kv_block_size, params.max_model_len, params.n_parallel_max,
-                    params.paged_admission.c_str(), params.kv_prefix_cache ? "on" : "off", params.paged_prefill_chunk);
+                    params.paged_admission.c_str(), params.kv_prefix_cache ? "on" : "off", params.paged_prefill_chunk,
+                    params.paged_prefill_target_ms, params.paged_decode_steps);
         } else if (params.n_parallel < 0) {
             SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
 

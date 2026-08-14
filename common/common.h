@@ -570,6 +570,8 @@ struct common_params {
     float paged_gpu_memory_utilization = 0.90f;
     int32_t kv_block_size  = 32;
     int32_t paged_prefill_chunk = 128;
+    float paged_prefill_target_ms = 50.0f;
+    int32_t paged_decode_steps = 3;
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
@@ -925,6 +927,7 @@ struct common_init_result {
 
     llama_model * model();
     llama_context * context();
+    bool rebuild_context(common_params & params);
 
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();

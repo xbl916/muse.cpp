@@ -38,6 +38,11 @@ struct llama_sampler_chain {
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 
+// Returns the number of unfiltered candidates needed to move the first top-k
+// ahead of the non-increasing sparse penalties in a backend sampler chain.
+// A zero return value means that the chain is not eligible for batched prefiltering.
+int32_t llama_sampler_backend_batch_prefilter_k(const llama_sampler * sampler);
+
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,
         float   dry_base,

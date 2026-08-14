@@ -1732,7 +1732,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_PAGED_ADMISSION").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--gpu-memory-utilization"}, "FLOAT",
-        string_format("paged KV target GPU memory utilization (default: %.2f)", params.paged_gpu_memory_utilization),
+        string_format("final paged KV target GPU memory utilization after all model components are loaded (default: %.2f)", params.paged_gpu_memory_utilization),
         [](common_params & params, const std::string & value) {
             params.paged_gpu_memory_utilization = std::stof(value);
             if (params.paged_gpu_memory_utilization <= 0.0f || params.paged_gpu_memory_utilization > 1.0f) {
@@ -1760,6 +1760,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.paged_prefill_chunk = value;
         }
     ).set_env("LLAMA_ARG_PAGED_PREFILL_CHUNK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--paged-prefill-target-ms"}, "N",
+        string_format("target latency for a competing prefill iteration (default: %.0f ms, 0 = fixed prefill chunk)", params.paged_prefill_target_ms),
+        [](common_params & params, const std::string & value_str) {
+            const float value = std::stof(value_str);
+            if (value < 0.0f) {
+                throw std::invalid_argument("paged prefill target must be non-negative");
+            }
+            params.paged_prefill_target_ms = value;
+        }
+    ).set_env("LLAMA_ARG_PAGED_PREFILL_TARGET_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--paged-decode-steps"}, "N",
+        string_format("decode iterations served between competing prefill iterations (default: %d)", params.paged_decode_steps),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("paged decode steps must be positive");
+            }
+            params.paged_decode_steps = value;
+        }
+    ).set_env("LLAMA_ARG_PAGED_DECODE_STEPS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--max-model-len"}, "N",
         "maximum context length for one paged request",
@@ -2855,7 +2876,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
     add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
-        "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
+        "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1\n"
+        "in tensor mode, divisible attention heads and KV heads are split evenly",
         [](common_params & params, const std::string & value) {
             std::string arg_next = value;
 

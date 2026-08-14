@@ -194,6 +194,69 @@ static std::vector<ggml_backend_dev_t> common_tensor_devices(const llama_model_p
     return result;
 }
 
+uint32_t common_paged_kv_expand_after_load(
+        const llama_context * ctx,
+        const std::vector<ggml_backend_dev_t> & devices,
+        const std::vector<size_t> & margins,
+        uint32_t max_tokens,
+        uint32_t alignment) {
+    const uint32_t current_tokens = llama_n_ctx(ctx);
+    if (current_tokens == 0 || devices.empty()) {
+        return current_tokens;
+    }
+
+    std::vector<size_t> context_bytes(devices.size(), 0);
+    const llama_memory_breakdown breakdown = llama_get_memory_breakdown(ctx);
+    for (const auto & [buft, mb] : breakdown) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        for (size_t i = 0; i < devices.size(); ++i) {
+            if (dev == devices[i]) {
+                context_bytes[i] += mb.context;
+                break;
+            }
+        }
+    }
+
+    int64_t extra_tokens = INT64_MAX;
+    bool has_context_shard = false;
+    for (size_t i = 0; i < devices.size(); ++i) {
+        if (context_bytes[i] == 0) {
+            continue;
+        }
+
+        ggml_backend_dev_t dev = devices[i];
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        GGML_UNUSED(total);
+
+        const size_t margin = i < margins.size() ? margins[i] : 0;
+        const int64_t available = int64_t(free) - int64_t(margin);
+        const int64_t fit = available > 0 ? available * current_tokens / int64_t(context_bytes[i]) : 0;
+        extra_tokens = std::min(extra_tokens, fit);
+        has_context_shard = true;
+
+        LOG_INF("%s: device %s context=%.2f MiB/%u tokens, free=%.2f MiB, reserve=%.2f MiB, room=%" PRId64 " tokens\n",
+                __func__, ggml_backend_dev_name(dev), context_bytes[i] / 1024.0 / 1024.0, current_tokens,
+                free / 1024.0 / 1024.0, margin / 1024.0 / 1024.0, fit);
+    }
+
+    if (!has_context_shard || extra_tokens <= 0) {
+        return current_tokens;
+    }
+
+    uint64_t expanded = uint64_t(current_tokens) + uint64_t(extra_tokens);
+    if (max_tokens > 0) {
+        expanded = std::min(expanded, uint64_t(max_tokens));
+    }
+    expanded = std::min<uint64_t>(expanded, UINT32_MAX);
+
+    alignment = std::max<uint32_t>(alignment, 256);
+    uint32_t result = uint32_t(expanded);
+    result -= result % alignment;
+    return std::max(result, current_tokens);
+}
+
 static void common_expand_paged_tensor_context(
         const char * path_model,
         llama_model_params * mparams,
@@ -277,7 +340,7 @@ static void common_expand_paged_tensor_context(
     cparams->n_ctx -= cparams->n_ctx % alignment;
     cparams->n_ctx = std::max(cparams->n_ctx, n_ctx_min);
 
-    LOG_INF("%s: tensor-parallel paged KV pool=%u tokens, per-sequence max=%u, safety=0.85\n",
+    LOG_INF("%s: tensor-parallel paged KV bootstrap pool=%u tokens, per-sequence max=%u, temporary safety=0.85\n",
             __func__, cparams->n_ctx, cparams->n_ctx_seq);
 }
 
@@ -951,7 +1014,7 @@ static void common_expand_paged_context(
     cparams->n_ctx -= cparams->n_ctx % alignment;
     cparams->n_ctx = std::max(cparams->n_ctx, n_ctx_ref);
 
-    LOG_INF("%s: paged KV pool context=%u tokens, per-sequence max=%u, safety=0.85\n",
+    LOG_INF("%s: paged KV bootstrap pool=%u tokens, per-sequence max=%u, temporary safety=0.85\n",
             __func__, cparams->n_ctx, cparams->n_ctx_seq);
 }
 

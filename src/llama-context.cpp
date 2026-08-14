@@ -1222,19 +1222,6 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        static bool warned = false;
-        if (!warned) {
-            LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
-            warned = true;
-        }
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
-        }
-        sampling.samplers.erase(seq_id);
-        return false;
-    }
-
     const bool can_offload =
         sampler &&
         sampler->iface->backend_init &&
@@ -2460,6 +2447,14 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    const size_t tensor_split_devices = model.n_tensor_devices();
+    bool tensor_split_equal = true;
+    if (const float * split = model.tensor_split()) {
+        for (size_t i = 1; i < tensor_split_devices; ++i) {
+            tensor_split_equal &= split[i] == split[0];
+        }
+    }
+
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2473,6 +2468,9 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
+        /*.tensor_split=*/ model.split_mode() == LLAMA_SPLIT_MODE_TENSOR,
+        /*.tensor_split_devices=*/ (uint32_t) tensor_split_devices,
+        /*.tensor_split_equal=*/ tensor_split_equal,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,

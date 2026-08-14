@@ -12,10 +12,37 @@ using namespace cub;
 
 #ifdef CUB_TOP_K_AVAILABLE
 
-static void top_k_cub(ggml_cuda_pool & pool,
+struct top_k_workspace {
+    void * ptr;
+    size_t size;
+};
+
+static std::mutex top_k_workspace_mutex;
+static std::unordered_map<ggml_backend_cuda_context *,
+        std::array<std::unordered_map<const ggml_tensor *, std::vector<top_k_workspace>>, GGML_CUDA_MAX_STREAMS>>
+        top_k_workspace_cache;
+
+static void * top_k_get_workspace(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, size_t size) {
+    std::lock_guard<std::mutex> lock(top_k_workspace_mutex);
+    auto & workspaces = top_k_workspace_cache[&ctx][ctx.curr_stream_no][dst];
+    for (const auto & workspace : workspaces) {
+        if (workspace.size >= size) {
+            return workspace.ptr;
+        }
+    }
+
+    void * ptr = nullptr;
+    CUDA_CHECK(cudaMalloc(&ptr, size));
+    workspaces.push_back({ ptr, size });
+    return ptr;
+}
+
+static void top_k_cub(ggml_backend_cuda_context & ctx,
+                      const ggml_tensor * dst_tensor,
                       const float *    src,
                       int *            dst,
                       const int        ncols,
+                      const int        nrows,
                       const int        k,
                       cudaStream_t     stream) {
     auto requirements = cuda::execution::require(cuda::execution::determinism::not_guaranteed,
@@ -29,11 +56,25 @@ static void top_k_cub(ggml_cuda_pool & pool,
     CUDA_CHECK(DeviceTopK::MaxPairs(nullptr, temp_storage_bytes, src, cuda::discard_iterator(), indexes_in, dst, ncols, k,
                          env));
 
-    ggml_cuda_pool_alloc<uint8_t> temp_storage_alloc(pool, temp_storage_bytes);
-    void *                        d_temp_storage = temp_storage_alloc.get();
+    // CUDA graphs can contain several TOP_K nodes. Give every logical node and
+    // row its own persistent CUB storage so captured kernels never alias a
+    // workspace used by another node or an asynchronously queued row.
+    const size_t temp_storage_stride = (temp_storage_bytes + 255) & ~size_t(255);
+    char * d_temp_storage = (char *) top_k_get_workspace(ctx, dst_tensor, temp_storage_stride * nrows);
 
-    CUDA_CHECK(DeviceTopK::MaxPairs(d_temp_storage, temp_storage_bytes, src, cuda::discard_iterator(), indexes_in, dst,
-                         ncols, k, env));
+    for (int i = 0; i < nrows; ++i) {
+        CUDA_CHECK(DeviceTopK::MaxPairs(d_temp_storage + i * temp_storage_stride, temp_storage_bytes,
+                             src + i * ncols, cuda::discard_iterator(), indexes_in, dst + i * k,
+                             ncols, k, env));
+    }
+
+    // Multi-row backend sampling may consume the candidate indices from a
+    // different meta-backend subgraph. Complete the single batched top-k here
+    // so the following GET_ROWS cannot observe partially written indices.
+    if (nrows > 1) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
 }
 
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
@@ -47,6 +88,28 @@ static int next_power_of_2(int x) {
 }
 
 #endif                            // CUB_TOP_K_AVAILABLE
+
+void ggml_cuda_top_k_free_workspaces(ggml_backend_cuda_context & ctx) {
+#ifdef CUB_TOP_K_AVAILABLE
+    std::lock_guard<std::mutex> lock(top_k_workspace_mutex);
+    const auto it = top_k_workspace_cache.find(&ctx);
+    if (it == top_k_workspace_cache.end()) {
+        return;
+    }
+
+    ggml_cuda_set_device(ctx.device);
+    for (const auto & stream_workspaces : it->second) {
+        for (const auto & entry : stream_workspaces) {
+            for (const auto & workspace : entry.second) {
+                CUDA_CHECK(cudaFree(workspace.ptr));
+            }
+        }
+    }
+    top_k_workspace_cache.erase(it);
+#else
+    GGML_UNUSED(ctx);
+#endif
+}
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
@@ -62,15 +125,13 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    ncols = src0->ne[0];
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
-    ggml_cuda_pool & pool  = ctx.pool();
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
     // TODO: investigate if there exists a point where parallelized argsort is faster than sequential top-k
-    for (int i = 0; i < nrows; i++) {
-        top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
-    }
+    top_k_cub(ctx, dst, src0_d, dst_d, ncols, nrows, k, stream);
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+    ggml_cuda_pool & pool  = ctx.pool();
     // Fall back to argsort + copy
     const int    ncols_pad      = next_power_of_2(ncols);
     const size_t shared_mem     = ncols_pad * sizeof(int);
@@ -96,6 +157,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         dst_d  += k     * iter_nrows;
     }
 #else                             // GGML_CUDA_USE_CUB
+    ggml_cuda_pool & pool  = ctx.pool();
     ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
     int *                     tmp_dst = temp_dst_alloc.get();
     argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);

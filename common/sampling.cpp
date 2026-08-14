@@ -120,9 +120,11 @@ struct common_sampler {
     std::vector<llama_token_data> cur;
 
     llama_token_data_array cur_p;
+    llama_token prepared_token = LLAMA_TOKEN_NULL;
 
     void reset() {
         prev.clear();
+        prepared_token = LLAMA_TOKEN_NULL;
 
         llama_sampler_reset(chain);
     }
@@ -507,7 +509,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -516,6 +518,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
     };
+    result->cur_p.data = gsmpl->cur_p.data ? result->cur.data() : nullptr;
+    return result;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -535,6 +539,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->prepared_token = LLAMA_TOKEN_NULL;
     dst->t_total_us = src->t_total_us;
 }
 
@@ -594,6 +599,18 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
+    common_sampler_prepare(gsmpl, ctx, idx);
+
+    return common_sampler_sample_prepared(gsmpl, grammar_first);
+}
+
+void common_sampler_prepare(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    gsmpl->set_logits(ctx, idx);
+    gsmpl->prepared_token = llama_get_sampled_token_ith(ctx, idx);
+}
+
+llama_token common_sampler_sample_prepared(struct common_sampler * gsmpl, bool grammar_first) {
+
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
 
@@ -604,12 +621,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
-
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
     {
-        id = llama_get_sampled_token_ith(ctx, idx);
+        id = gsmpl->prepared_token;
+        gsmpl->prepared_token = LLAMA_TOKEN_NULL;
 
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
@@ -635,6 +651,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_sampler_apply(grmr, &cur_p);
     }
 
+    std::vector<llama_token_data> cur_original;
+    if (!grammar_first && grammar_should_apply(gsmpl)) {
+        cur_original = gsmpl->cur;
+    }
+
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
@@ -658,7 +679,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
+    gsmpl->cur = std::move(cur_original);
+    cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), -1, false };
 
     llama_sampler_apply(rbudget,  &cur_p);
 

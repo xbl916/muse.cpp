@@ -716,6 +716,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
         }
     }
+    ggml_cuda_top_k_free_workspaces(*this);
 }
 
 
@@ -2542,17 +2543,32 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+static constexpr int32_t GGML_TENSOR_FLAG_META_PRIMARY_INTERNAL = 128;
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+    bool has_compute = false;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 
-        if (ggml_cuda_is_view_or_noop(node)) {
+        if (node->flags & GGML_TENSOR_FLAG_META_PRIMARY_INTERNAL) {
+            return false;
+        }
+
+        // CUB DeviceTopK uses persistent temporary storage that is safe for
+        // asynchronous execution but cannot be rebound across changing
+        // multi-row CUDA graph captures.
+        if (node->op == GGML_OP_TOP_K) {
+            return false;
+        }
+
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_cuda_is_view_or_noop(node)) {
             continue;
         }
+        has_compute = true;
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
@@ -2572,7 +2588,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         }
     }
 
-    return use_cuda_graph;
+    return use_cuda_graph && has_compute;
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {

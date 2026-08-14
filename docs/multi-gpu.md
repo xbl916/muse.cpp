@@ -35,7 +35,7 @@ Set with `--split-mode` / `-sm`.
 | Short | Long | Value | Default | Notes |
 |---|---|---|---|---|
 | `-sm` | `--split-mode` | `none` \| `layer` \| `tensor` | `layer` | See modes above. |
-| `-ts` | `--tensor-split` | comma-separated proportions, e.g. `3,1` | mode-dependent | How much of the model goes to each GPU. If omitted, `layer`/`row` use automatic splitting proportional to memory, while `tensor` splits tensor segments evenly. With `3,1` on two GPUs, GPU 0 gets 75 %, GPU 1 gets 25 %. The values follow the order in `--device`. |
+| `-ts` | `--tensor-split` | comma-separated proportions, e.g. `3,1` | mode-dependent | How much of the model goes to each GPU. If omitted, `layer`/`row` use automatic splitting proportional to memory. In `tensor` mode, divisible attention heads and KV heads are split evenly; the proportions apply to the remaining tensors. The values follow the order in `--device`. |
 | `-mg` | `--main-gpu` | integer device index | `0` | The single GPU used in `--split-mode none`. |
 | `-ngl` | `--n-gpu-layers` / `--gpu-layers` | integer \| `auto` \| `all` | `auto` | Maximum number of layers to keep in VRAM. Use `999` or `all` to push everything possible to the GPUs. |
 | `-dev` | `--device` | comma-separated device names, or `none` | auto | Restrict which devices llama.cpp may use. See `--list-devices` for names. |
@@ -44,6 +44,10 @@ Set with `--split-mode` / `-sm`.
 | `-ctk` | `--cache-type-k` | `f32` \| `f16` \| `bf16` \| `q8_0` \| `q4_0` \| ... | `f16` | KV cache type for K. |
 | `-ctv` | `--cache-type-v` | same as `-ctk` | `f16` | KV cache type for V. |
 | `-fit` | `--fit` | `on` \| `off` | `on` | Auto-fit unset args to device memory. Paged `tensor` mode measures each physical device and sizes the shared KV pool from the limiting local KV shard. General non-paged tensor auto-fit is not implemented. |
+| | `--gpu-memory-utilization` | float in `(0, 1]` | `0.90` | Final per-GPU memory utilization target for paged KV. The server loads MTP and multimodal components first, then expands the bootstrap KV pool from the measured free memory. |
+| | `--paged-prefill-chunk` | integer | `128` | Hard ceiling on prompt tokens added to an iteration while one or more requests are decoding. Solo prefill is unaffected. |
+| | `--paged-prefill-target-ms` | milliseconds | `50` | Target duration for prefill iterations that compete with active decoders. Decode and prefill use separate CUDA batches; the scheduler measures completed prefill iterations and adjusts among reusable power-of-two prompt budgets, with 32 as the minimum fast-path shape. Set to `0` to use a fixed chunk. |
+| | `--paged-decode-steps` | integer | `3` | Number of decode engine steps served between competing prefill iterations. Increase it to protect streaming decode latency; decrease it to admit long prompts faster. |
 
 As for any CUDA program, the environment variable `CUDA_VISIBLE_DEVICES` can be used to control which GPUs to use for the CUDA backend: if you set it, llama.cpp only sees the specified GPUs. Use `--device` for selecting GPUs from among those visible to llama.cpp, this works for any backend.
 
@@ -85,6 +89,7 @@ llama-cli -m model.gguf -sm tensor -ctk q8_0 -ctv q8_0 -fa on
 
 - `--flash-attn off` or (`--flash-attn auto` resolving to `off` when it isn't supported) is a hard error.
 - Quantized K/V cache is supported by the CUDA Meta path. Validate output quality for each model and cache type.
+- With `--backend-sampling`, common penalty -> top-k -> top-p -> temperature chains use a batched sampler graph. In tensor mode with an equal tensor split, each GPU computes a local top-k and only the small merged candidate set is transferred to the primary GPU. Non-increasing repeat/frequency/presence penalties are handled exactly by enlarging the local candidate set. Uneven tensor splits and chains with logit bias, negative penalties, disabled top-k, or another unsupported prefix safely fall back to full-logit gathering.
 - Mark this configuration as experimental in your tooling: validate output quality before deploying.
 - `--split-mode tensor`is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"*:
 
@@ -121,6 +126,7 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs) 
 | Startup error *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'X'"* | Architecture not on the TENSOR allow-list. Use `--split-mode layer`. |
 | Warning *"NCCL is unavailable, multi GPU performance will be suboptimal"* | llama.cpp wasn't built with NCCL. Either accept the lower performance or install NCCL and rebuild. |
 | CUDA OOM at startup or during prefill in paged `--split-mode tensor` | Lower `--gpu-memory-utilization` or `--max-model-len`. The startup log reports the limiting device and the measured local KV shard size. |
+| Decode pauses while another request is in long prefill | Keep adaptive prefill enabled. Start with `--paged-prefill-target-ms 50`; use 25-40 for lower decode latency or 75-100 for more prefill throughput. `--paged-prefill-chunk` is only the maximum when adaptation is enabled. |
 | Performance is worse with multi-GPU than single-GPU | The performance is bottlenecked by GPU interconnect speed. For two PCIe CUDA GPUs, try the default internal AllReduce. For NVLink, compare it with `GGML_CUDA_ALLREDUCE=nccl`. |
 | GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or you are accidentally hiding the GPUs via an environment variable like `CUDA_VISIBLE_DEVICES=-1`. Or your build doesn't include support for the relevant backend. |
 | Crashes or corrupted outputs after setting `GGML_CUDA_P2P=1` | Some motherboards and BIOS settings (e.g. with IOMMU enabled) don't support CUDA peer-to-peer reliably. Unset `GGML_CUDA_P2P`. |

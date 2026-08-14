@@ -18,11 +18,16 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <filesystem>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <fstream>
 
@@ -38,6 +43,100 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+class server_sampling_pool {
+public:
+    explicit server_sampling_pool(size_t n_threads) {
+        for (size_t i = 1; i < n_threads; ++i) {
+            workers.emplace_back([this]() { worker(); });
+        }
+    }
+
+    ~server_sampling_pool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+            generation++;
+        }
+        cv_work.notify_all();
+        for (auto & thread : workers) {
+            thread.join();
+        }
+    }
+
+    void run(const std::vector<std::function<void()>> & jobs) {
+        if (jobs.empty()) {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            current_jobs = &jobs;
+            next_job = 0;
+            remaining = jobs.size();
+            generation++;
+        }
+        cv_work.notify_all();
+
+        run_jobs();
+
+        std::unique_lock<std::mutex> lock(mutex);
+        cv_done.wait(lock, [this]() { return remaining == 0; });
+        current_jobs = nullptr;
+    }
+
+    size_t size() const {
+        return workers.size() + 1;
+    }
+
+private:
+    std::vector<std::thread> workers;
+    std::mutex mutex;
+    std::condition_variable cv_work;
+    std::condition_variable cv_done;
+    const std::vector<std::function<void()>> * current_jobs = nullptr;
+    size_t next_job = 0;
+    size_t remaining = 0;
+    uint64_t generation = 0;
+    bool stopping = false;
+
+    void run_jobs() {
+        while (true) {
+            std::function<void()> job;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (current_jobs == nullptr || next_job >= current_jobs->size()) {
+                    return;
+                }
+                job = (*current_jobs)[next_job++];
+            }
+
+            job();
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (--remaining == 0) {
+                    cv_done.notify_one();
+                }
+            }
+        }
+    }
+
+    void worker() {
+        uint64_t seen_generation = 0;
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv_work.wait(lock, [&]() { return stopping || generation != seen_generation; });
+                if (stopping) {
+                    return;
+                }
+                seen_generation = generation;
+            }
+            run_jobs();
+        }
+    }
+};
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -963,6 +1062,7 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+    std::unique_ptr<server_sampling_pool> sampling_pool;
 
     int trace = 0;
     int slots_debug = 0;
@@ -971,6 +1071,21 @@ private:
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
+
+    // The mixed decode/prefill batch must remain small enough that an incoming
+    // prompt cannot monopolize the shared CUDA graph. The controller learns the
+    // appropriate token budget from completed iterations because prompt cost
+    // depends heavily on GPU generation and current KV length.
+    int32_t paged_prefill_chunk_dynamic = 0;
+    int32_t paged_batch_decode_tokens   = 0;
+    int32_t paged_batch_prompt_tokens   = 0;
+    int32_t paged_prefill_samples       = 0;
+    double  paged_decode_only_ms        = 0.0;
+    double  paged_prefill_ewma_ms       = 0.0;
+    int64_t paged_prefill_log_us        = 0;
+    int32_t paged_decode_steps_remaining = 0;
+    bool    paged_was_competing          = false;
+    bool    paged_batch_prefill_competing = false;
 
     json json_ui_settings = json::object();
 
@@ -1057,6 +1172,16 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        paged_prefill_chunk_dynamic = 0;
+        paged_batch_decode_tokens   = 0;
+        paged_batch_prompt_tokens   = 0;
+        paged_prefill_samples       = 0;
+        paged_decode_only_ms        = 0.0;
+        paged_prefill_ewma_ms       = 0.0;
+        paged_prefill_log_us        = 0;
+        paged_decode_steps_remaining = 0;
+        paged_was_competing          = false;
+        paged_batch_prefill_competing = false;
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1067,6 +1192,7 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+        const std::vector<size_t> paged_memory_reserve = params_base.fit_params_target;
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1219,37 +1345,50 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        if (has_spec) {
-            // spec_mtp doesn't use load a model internally, so we report 0.0 and 1.0 manually
-            load_progress_callback(0.0f, &load_progress_spec);
-            load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
-
-            {
-                common_params params_dft = common_base_params_to_speculative(params_base);
-
-                // progress callback
-                params_dft.load_progress_callback           = load_progress_callback;
-                params_dft.load_progress_callback_user_data = &load_progress_spec;
-
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
-                model_dft = spec_init->model();
-                ctx_dft   = spec_init->context();
-
-                if (has_draft && model_dft == nullptr) {
-                    SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
-                    return false;
-                }
-
-                if (ctx_dft == nullptr) {
-                    SRV_ERR("%s", "failed to create MTP context\n");
-                    return false;
-                }
-
-                params_base.speculative.draft.ctx_tgt = ctx_tgt;
-                params_base.speculative.draft.ctx_dft = ctx_dft;
+        auto load_spec_context = [&](bool report_progress) {
+            if (!has_spec) {
+                return true;
             }
 
-            load_progress_callback(1.0f, &load_progress_spec);
+            if (report_progress) {
+                load_progress_callback(0.0f, &load_progress_spec);
+                load_progress_spec.t_last_load_progress_ms = 0;
+            }
+
+            common_params params_dft = common_base_params_to_speculative(params_base);
+            if (report_progress) {
+                params_dft.load_progress_callback           = load_progress_callback;
+                params_dft.load_progress_callback_user_data = &load_progress_spec;
+            } else {
+                params_dft.load_progress_callback           = nullptr;
+                params_dft.load_progress_callback_user_data = nullptr;
+            }
+
+            spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+            model_dft = spec_init->model();
+            ctx_dft   = spec_init->context();
+
+            if (has_draft && model_dft == nullptr) {
+                SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
+                return false;
+            }
+
+            if (ctx_dft == nullptr) {
+                SRV_ERR("%s", "failed to create MTP context\n");
+                return false;
+            }
+
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            params_base.speculative.draft.ctx_dft = ctx_dft;
+
+            if (report_progress) {
+                load_progress_callback(1.0f, &load_progress_spec);
+            }
+            return true;
+        };
+
+        if (!load_spec_context(true)) {
+            return false;
         }
 
         if (has_mmproj) {
@@ -1276,6 +1415,97 @@ private:
             if (params_base.n_cache_reuse) {
                 params_base.n_cache_reuse = 0;
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
+            }
+        }
+
+        if (params_base.paged_kv && params_base.fit_params && params.n_ctx == 0) {
+            llama_synchronize(ctx_tgt);
+            if (ctx_dft != nullptr) {
+                llama_synchronize(ctx_dft);
+            }
+
+            const uint32_t current_pool = llama_n_ctx(ctx_tgt);
+            uint64_t max_pool = UINT32_MAX;
+            const int32_t max_sequences = params_base.n_parallel_max > 0 ? params_base.n_parallel_max : params_base.n_parallel;
+            if (params_base.max_model_len > 0 && max_sequences > 0) {
+                max_pool = std::min<uint64_t>(uint64_t(params_base.max_model_len) * max_sequences, UINT32_MAX);
+            }
+
+            std::vector<ggml_backend_dev_t> paged_devices = params_base.devices;
+            if (paged_devices.empty()) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        paged_devices.push_back(dev);
+                    }
+                }
+            }
+
+            const uint32_t expanded_pool = common_paged_kv_expand_after_load(
+                    ctx_tgt,
+                    paged_devices,
+                    paged_memory_reserve,
+                    uint32_t(max_pool),
+                    params_base.kv_block_size);
+
+            if (expanded_pool > current_pool) {
+                SRV_INF("post-load paged KV expansion: %u -> %u tokens, governed by --gpu-memory-utilization=%.3f\n",
+                        current_pool, expanded_pool, params_base.paged_gpu_memory_utilization);
+
+                spec_init.reset();
+                ctx_dft   = nullptr;
+                model_dft = nullptr;
+                params_base.speculative.draft.ctx_tgt = nullptr;
+                params_base.speculative.draft.ctx_dft = nullptr;
+
+                common_params params_rebuild = params_base;
+                params_rebuild.fit_params = false;
+                params_rebuild.n_ctx = expanded_pool;
+
+                if (!llama_init->rebuild_context(params_rebuild)) {
+                    SRV_WRN("post-load KV expansion failed; restoring the initial %u-token pool\n", current_pool);
+                    params_rebuild.n_ctx = current_pool;
+                    if (!llama_init->rebuild_context(params_rebuild)) {
+                        SRV_ERR("failed to restore the initial %u-token context\n", current_pool);
+                        return false;
+                    }
+                }
+
+                ctx_tgt = llama_init->context();
+                n_ctx = llama_n_ctx(ctx_tgt);
+
+                if (!load_spec_context(false)) {
+                    if (llama_n_ctx(ctx_tgt) <= current_pool) {
+                        return false;
+                    }
+
+                    SRV_WRN("MTP/draft reload failed after KV expansion; restoring the initial %u-token pool\n", current_pool);
+                    spec_init.reset();
+                    ctx_dft   = nullptr;
+                    model_dft = nullptr;
+                    params_base.speculative.draft.ctx_tgt = nullptr;
+                    params_base.speculative.draft.ctx_dft = nullptr;
+
+                    params_rebuild.n_ctx = current_pool;
+                    if (!llama_init->rebuild_context(params_rebuild)) {
+                        SRV_ERR("failed to restore the initial %u-token context\n", current_pool);
+                        return false;
+                    }
+
+                    ctx_tgt = llama_init->context();
+                    n_ctx = llama_n_ctx(ctx_tgt);
+                    if (!load_spec_context(false)) {
+                        return false;
+                    }
+                }
+
+                SRV_INF("post-load paged KV pool ready: %u tokens\n", n_ctx);
+            } else {
+                if (current_pool >= max_pool) {
+                    SRV_INF("post-load paged KV pool remains %u tokens; configured request capacity is already reached\n", current_pool);
+                } else {
+                    SRV_INF("post-load paged KV pool remains %u tokens; memory utilization target is already reached\n", current_pool);
+                }
             }
         }
 
@@ -1338,6 +1568,12 @@ private:
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
+        }
+
+        if (!sampling_pool) {
+            const size_t n_sampling_threads = std::max<size_t>(1, std::min(params_base.n_parallel, params_base.cpuparams.n_threads));
+            sampling_pool = std::make_unique<server_sampling_pool>(n_sampling_threads);
+            SRV_INF("CPU sampling pool initialized with %zu threads\n", sampling_pool->size());
         }
 
         // try speculative decoding
@@ -2941,6 +3177,8 @@ private:
             }
         }
 
+        const int64_t t_iteration_start = ggml_time_us();
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -3011,6 +3249,86 @@ private:
                 break; // stop any further processing
             }
         }
+
+        update_paged_prefill_controller((ggml_time_us() - t_iteration_start) / 1000.0);
+    }
+
+    int32_t get_paged_prefill_chunk() {
+        const int32_t chunk_max = params_base.paged_prefill_chunk;
+        if (chunk_max <= 0 || params_base.paged_prefill_target_ms <= 0.0f) {
+            return chunk_max;
+        }
+
+        if (paged_prefill_chunk_dynamic <= 0) {
+            // Keep quantized paged FA on its MMA path while starting with a
+            // bounded quantum. The controller uses power-of-two shapes so CUDA
+            // graphs are reused instead of being rebuilt for arbitrary sizes.
+            paged_prefill_chunk_dynamic = std::min(chunk_max, 64);
+        }
+
+        return std::clamp(paged_prefill_chunk_dynamic, 1, chunk_max);
+    }
+
+    void update_paged_prefill_controller(double elapsed_ms) {
+        if (params_base.scheduler != "paged" || params_base.paged_prefill_chunk <= 0 ||
+                params_base.paged_prefill_target_ms <= 0.0f) {
+            return;
+        }
+
+        if (paged_batch_decode_tokens > 0 && paged_batch_prompt_tokens == 0) {
+            constexpr double alpha = 0.15;
+            paged_decode_only_ms = paged_decode_only_ms == 0.0 ? elapsed_ms :
+                (1.0 - alpha) * paged_decode_only_ms + alpha * elapsed_ms;
+            return;
+        }
+
+        if (!paged_batch_prefill_competing || paged_batch_prompt_tokens <= 0) {
+            return;
+        }
+
+        const int32_t old_chunk = get_paged_prefill_chunk();
+        if (paged_batch_prompt_tokens < old_chunk) {
+            return;
+        }
+
+        // The first execution of a new shape includes CUDA graph construction.
+        // Do not let that one-time cost collapse the steady-state token budget.
+        if (paged_prefill_samples++ == 0) {
+            paged_prefill_ewma_ms = 0.0;
+            return;
+        }
+
+        constexpr double alpha = 0.35;
+        paged_prefill_ewma_ms = paged_prefill_ewma_ms == 0.0 ? elapsed_ms :
+            (1.0 - alpha) * paged_prefill_ewma_ms + alpha * elapsed_ms;
+
+        if (paged_prefill_samples < 4) {
+            return;
+        }
+
+        const double target_ms = params_base.paged_prefill_target_ms;
+        const int32_t chunk_min = std::min(params_base.paged_prefill_chunk, 32);
+        int32_t new_chunk = old_chunk;
+        if (paged_prefill_ewma_ms > target_ms * 1.25 && old_chunk > chunk_min) {
+            new_chunk = std::max(chunk_min, old_chunk / 2);
+        } else if (paged_prefill_ewma_ms < target_ms * 0.60 && old_chunk < params_base.paged_prefill_chunk) {
+            new_chunk = std::min(params_base.paged_prefill_chunk, old_chunk * 2);
+        }
+
+        if (new_chunk == old_chunk) {
+            return;
+        }
+
+        paged_prefill_chunk_dynamic = new_chunk;
+        paged_prefill_samples = 0;
+        paged_prefill_ewma_ms = 0.0;
+
+        const int64_t now = ggml_time_us();
+        if (now - paged_prefill_log_us >= 5 * 1000 * 1000) {
+            paged_prefill_log_us = now;
+            SRV_INF("adaptive paged prefill: chunk %d -> %d, prefill iteration %.1f ms, decode baseline %.1f ms, target %.1f ms\n",
+                    old_chunk, new_chunk, elapsed_ms, paged_decode_only_ms, target_ms);
+        }
     }
 
     void pre_decode() {
@@ -3080,6 +3398,36 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+        paged_batch_decode_tokens = 0;
+        paged_batch_prompt_tokens = 0;
+        paged_batch_prefill_competing = false;
+
+        bool has_generating = false;
+        bool has_prompt = false;
+        for (const auto & slot : slots) {
+            has_generating |= slot.state == SLOT_STATE_GENERATING;
+            has_prompt |= slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED;
+        }
+
+        const bool paged_has_competing_prefill = params_base.scheduler == "paged" && has_generating && has_prompt;
+        if (paged_has_competing_prefill && !paged_was_competing) {
+            // A newly arrived prompt must not delay the next token of an
+            // already-running response.
+            paged_decode_steps_remaining = 1;
+        }
+
+        const bool paged_run_prefill = paged_has_competing_prefill && paged_decode_steps_remaining == 0;
+        if (paged_has_competing_prefill) {
+            if (paged_run_prefill) {
+                paged_decode_steps_remaining = params_base.paged_decode_steps;
+            } else {
+                --paged_decode_steps_remaining;
+            }
+        } else {
+            paged_decode_steps_remaining = 0;
+        }
+        paged_was_competing = paged_has_competing_prefill;
+        paged_batch_prefill_competing = paged_run_prefill;
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -3092,6 +3440,10 @@ private:
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
+            if (paged_run_prefill) {
+                return;
+            }
+
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
@@ -3218,14 +3570,15 @@ private:
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+        paged_batch_decode_tokens = batch.size();
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
         int32_t prompt_batch_limit = n_batch;
-        if (params_base.scheduler == "paged" && !generating.empty() && params_base.paged_prefill_chunk > 0) {
-            prompt_batch_limit = std::min(n_batch, batch.size() + params_base.paged_prefill_chunk);
+        if (paged_has_competing_prefill && params_base.paged_prefill_chunk > 0) {
+            prompt_batch_limit = paged_run_prefill ? std::min(n_batch, get_paged_prefill_chunk()) : batch.size();
         }
 
         int32_t n_prompt_slots = 0;
@@ -3761,6 +4114,8 @@ private:
                 }
             });
         }
+
+        paged_batch_prompt_tokens = batch.size() - paged_batch_decode_tokens;
     }
 
     // returns true = success ; false = retry with smaller batch size
@@ -3900,6 +4255,16 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        struct pending_sample {
+            server_slot * slot;
+            int tok_idx;
+            llama_token id = LLAMA_TOKEN_NULL;
+            std::exception_ptr error;
+        };
+
+        std::vector<pending_sample> pending_samples;
+        pending_samples.reserve(slots.size());
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -3947,53 +4312,95 @@ private:
 
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
+            pending_samples.push_back({ &slot, tok_idx, LLAMA_TOKEN_NULL, nullptr });
+        });
 
-            llama_token id;
+        if (!pending_samples.empty()) {
+            llama_synchronize(ctx_tgt);
+
+            for (auto & sample : pending_samples) {
+                try {
+                    common_sampler_prepare(sample.slot->smpl.get(), sample.slot->ctx_tgt, sample.tok_idx);
+                } catch (...) {
+                    sample.error = std::current_exception();
+                }
+            }
+
+            std::vector<std::function<void()>> jobs;
+            jobs.reserve(pending_samples.size());
+            for (auto & sample : pending_samples) {
+                jobs.emplace_back([&sample]() {
+                    if (sample.error) {
+                        return;
+                    }
+                    try {
+                        sample.id = common_sampler_sample_prepared(sample.slot->smpl.get());
+                    } catch (...) {
+                        sample.error = std::current_exception();
+                    }
+                });
+            }
+
             {
                 scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                sampling_pool->run(jobs);
             }
+        }
 
-            slot.i_batch = -1;
+        for (auto & sample : pending_samples) {
+            server_slot & slot = *sample.slot;
 
-            common_sampler_accept(slot.smpl.get(), id, true);
+            try {
+                if (sample.error) {
+                    std::rethrow_exception(sample.error);
+                }
 
-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-            const int64_t t_now = ggml_time_us();
+                const llama_token id = sample.id;
+                const int tok_idx = sample.tok_idx;
 
-            slot.n_decoded += 1;
+                slot.i_batch = -1;
 
-            if (slot.n_decoded == 1) {
-                slot.t_start_generation = t_now;
-                slot.t_print_last = t_now;
-                slot.n_decoded_last = 0;
-                slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
-                metrics.on_prompt_eval(slot);
-            }
+                common_sampler_accept(slot.smpl.get(), id, true);
 
-            slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
+                const int64_t t_now = ggml_time_us();
 
-            completion_token_output result;
-            result.tok          = id;
-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+                slot.n_decoded += 1;
 
-            if (slot.task->params.sampling.n_probs > 0) {
-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
-            }
+                if (slot.n_decoded == 1) {
+                    slot.t_start_generation = t_now;
+                    slot.t_print_last = t_now;
+                    slot.n_decoded_last = 0;
+                    slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                    metrics.on_prompt_eval(slot);
+                }
 
-            if (!process_token(result, slot)) {
-                // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                metrics.on_prediction(slot);
+                slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
+
+                completion_token_output result;
+                result.tok          = id;
+                result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+                result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+
+                if (slot.task->params.sampling.n_probs > 0) {
+                    populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+                }
+
+                if (!process_token(result, slot)) {
+                    slot.print_timings();
+                    send_final_response(slot);
+                    metrics.on_prediction(slot);
+                    slot.release();
+
+                    continue;
+                }
+
+                slot.print_timings_tg();
+            } catch (const std::exception & e) {
+                SLT_ERR(slot, "got exception: %s\n", e.what());
+                send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                 slot.release();
-
-                return;
             }
-
-            slot.print_timings_tg();
-        });
+        }
 
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {

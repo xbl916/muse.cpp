@@ -1390,6 +1390,86 @@ llama_context * common_init_result::context() {
     return pimpl->context.get();
 }
 
+bool common_init_result::rebuild_context(common_params & params) {
+    auto cparams = common_context_params_to_llama(params);
+
+    if (pimpl->samplers.size() != cparams.n_seq_max) {
+        COM_ERR("%s", "cannot rebuild context with a different sequence count\n");
+        return false;
+    }
+
+    if (params.sampling.backend_sampling) {
+        cparams.samplers   = pimpl->samplers_seq_config.data();
+        cparams.n_samplers = pimpl->samplers_seq_config.size();
+    }
+
+    pimpl->context.reset();
+
+    llama_context * lctx = llama_init_from_model(pimpl->model.get(), cparams);
+    if (lctx == nullptr) {
+        COM_ERR("failed to rebuild context with model '%s'\n", params.model.path.c_str());
+        return false;
+    }
+
+    pimpl->context.reset(lctx);
+
+    if (!params.control_vectors.empty()) {
+        const int32_t layer_start = params.control_vector_layer_start > 0 ? params.control_vector_layer_start : 1;
+        const int32_t layer_end = params.control_vector_layer_end > 0 ? params.control_vector_layer_end : llama_model_n_layer(pimpl->model.get());
+        const auto cvec = common_control_vector_load(params.control_vectors);
+        if (cvec.n_embd == -1 || llama_set_adapter_cvec(
+                lctx,
+                cvec.data.data(),
+                cvec.data.size(),
+                cvec.n_embd,
+                layer_start,
+                layer_end)) {
+            pimpl->context.reset();
+            return false;
+        }
+    }
+
+    if (!params.lora_init_without_apply) {
+        common_set_adapter_lora(lctx, params.lora_adapters);
+    }
+
+    if (params.warmup) {
+        const llama_vocab * vocab = llama_model_get_vocab(pimpl->model.get());
+        std::vector<llama_token> tmp;
+        const llama_token bos = llama_vocab_bos(vocab);
+        const llama_token eos = llama_vocab_eos(vocab);
+
+        if (bos != LLAMA_TOKEN_NULL) {
+            tmp.push_back(bos);
+        }
+        if (eos != LLAMA_TOKEN_NULL) {
+            tmp.push_back(eos);
+        }
+        if (tmp.empty()) {
+            tmp.push_back(0);
+        }
+
+        if (llama_model_has_encoder(pimpl->model.get())) {
+            llama_encode(lctx, llama_batch_get_one(tmp.data(), tmp.size()));
+            llama_token decoder_start_token_id = llama_model_decoder_start_token(pimpl->model.get());
+            if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
+                decoder_start_token_id = bos;
+            }
+            tmp.clear();
+            tmp.push_back(decoder_start_token_id);
+        }
+        if (llama_model_has_decoder(pimpl->model.get())) {
+            llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
+        }
+        llama_memory_clear(llama_get_memory(lctx), true);
+        llama_synchronize(lctx);
+        llama_perf_context_reset(lctx);
+        reset_samplers();
+    }
+
+    return true;
+}
+
 common_sampler * common_init_result::sampler(llama_seq_id seq_id) {
     if (seq_id < 0 || seq_id >= (int) pimpl->samplers.size()) {
         return nullptr;

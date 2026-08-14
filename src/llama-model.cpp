@@ -397,10 +397,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         uint32_t il;
         size_t   rotation; // when assigning tensor slices, rotate how the rounding is done for more even allocation
+        bool     equal_split;
     };
 
     auto get_tensor_config_impl = [&](
-                const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "") -> tensor_config {
+                const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "",
+                bool equal_split = false) -> tensor_config {
         // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
         //     count only the same type of previous layers to avoid this
         auto get_il_eff = [&](const size_t il){
@@ -438,38 +440,39 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
         }
         GGML_ASSERT(tensor_axis_0 != nullptr);
-        return {axis, tensor_axis_0, il, rotation};
+        return {axis, tensor_axis_0, il, rotation, equal_split};
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight", true);
         }
         if (std::regex_match(tensor_name, pattern_q_bias) || std::regex_match(tensor_name, pattern_kv_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight", true);
         }
         if (std::regex_match(tensor_name, pattern_qkv_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight", true);
         }
         if ( std::regex_match(tensor_name, pattern_qkv_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight", true);
         }
         if (std::regex_match(tensor_name, pattern_qk_norm)) {
-            return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1,
+                    "attn_output.weight", "", true);
         }
         if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "", true);
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "", "", true);
         }
         if (std::regex_match(tensor_name, pattern_attn_out_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED, "", "", true);
         }
 
         if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight", true);
         }
         if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
@@ -679,7 +682,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
-        const float * tensor_split = ud->model->tensor_split();
+        const bool equal_split = tc.equal_split && !hparams.is_recr(tc.il) &&
+            hparams.n_head(tc.il) % ud->n_devices == 0 && hparams.n_head_kv(tc.il) % ud->n_devices == 0;
+        const float * tensor_split = equal_split ? nullptr : ud->model->tensor_split();
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
@@ -1726,6 +1731,10 @@ size_t llama_model::n_tensors() const {
 
 size_t llama_model::n_devices() const {
     return devices.size();
+}
+
+size_t llama_model::n_tensor_devices() const {
+    return params.split_mode == LLAMA_SPLIT_MODE_TENSOR ? get_split_state_ud.n_devices : devices.size();
 }
 
 const float * llama_model::tensor_split() const {

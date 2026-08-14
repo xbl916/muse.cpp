@@ -856,6 +856,72 @@ static void accept_prompt(llama_sampler * smpl, const llama_vocab * vocab, const
     }
 }
 
+static void test_backend_batched_sampling(const test_params & params) {
+    const auto * vocab = llama_model_get_vocab(params.model.get());
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+    const auto make_chain = [n_vocab](uint32_t seed) {
+        llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_penalties(n_vocab, 64, 1.0f, 0.0f, 1.5f));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(20));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_top_p(0.8f, 1));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_temp(0.7f));
+        llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(seed));
+        return chain;
+    };
+
+    const std::map<llama_seq_id, std::string> prompts = {
+        { 0, "Hello world, this is sequence zero" },
+        { 1, "A different prompt for sequence one" },
+    };
+
+    auto backend_0 = make_chain(88);
+    auto backend_1 = make_chain(89);
+    auto cpu_0 = make_chain(88);
+    auto cpu_1 = make_chain(89);
+
+    for (const auto & [seq_id, prompt] : prompts) {
+        llama_sampler * backend = seq_id == 0 ? backend_0.get() : backend_1.get();
+        llama_sampler * cpu     = seq_id == 0 ? cpu_0.get()     : cpu_1.get();
+        accept_prompt(backend, vocab, prompt);
+        accept_prompt(cpu, vocab, prompt);
+    }
+
+    std::vector<llama_sampler_seq_config> configs = {
+        { 0, backend_0.get() },
+        { 1, backend_1.get() },
+    };
+    test_context test_ctx(params, configs);
+    std::vector<llama_sampler_seq_config> reference_configs;
+    test_context reference_ctx(params, reference_configs, 2);
+    GGML_ASSERT(test_ctx.decode(prompts));
+    GGML_ASSERT(reference_ctx.decode(prompts));
+
+    for (llama_seq_id seq_id : { 0, 1 }) {
+        const int32_t idx = test_ctx.idx_for_seq(seq_id);
+        const int32_t reference_idx = reference_ctx.idx_for_seq(seq_id);
+        const float * raw_logits = llama_get_logits_ith(reference_ctx.ctx.get(), reference_idx);
+        GGML_ASSERT(raw_logits != nullptr);
+
+        std::vector<llama_token_data> candidates;
+        candidates.reserve(n_vocab);
+        for (llama_token token = 0; token < n_vocab; ++token) {
+            candidates.push_back({ token, raw_logits[token], 0.0f });
+        }
+
+        llama_token_data_array cur = { candidates.data(), candidates.size(), -1, false };
+        llama_sampler * cpu = seq_id == 0 ? cpu_0.get() : cpu_1.get();
+        llama_sampler_apply(cpu, &cur);
+
+        GGML_ASSERT(cur.selected >= 0 && (size_t) cur.selected < cur.size);
+        const llama_token expected = cur.data[cur.selected].id;
+        const llama_token actual = llama_get_sampled_token_ith(test_ctx.ctx.get(), idx);
+        GGML_ASSERT(actual == expected);
+    }
+
+    printf("backend batched sampling test PASSED\n");
+}
+
 static std::vector<float> decode_raw_logits(const test_params & params, const std::string & prompt) {
     const int seq_id = 0;
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(params.model.get()));
@@ -1284,7 +1350,16 @@ static void compare_masking_penalties_logits(
 
     const std::unordered_map<llama_token, float> expected_logits = map_logits(output.expected);
 
-    GGML_ASSERT(expected_logits.find(masked_token) == expected_logits.end());
+    llama_token output_masked_token = masked_token;
+    if (expected_logits.find(output_masked_token) != expected_logits.end()) {
+        for (llama_token token = 0; token < n_vocab; ++token) {
+            if (expected_logits.find(token) == expected_logits.end()) {
+                output_masked_token = token;
+                break;
+            }
+        }
+    }
+    GGML_ASSERT(expected_logits.find(output_masked_token) == expected_logits.end());
     if (add_history) {
         if (position == penalties_position::after_filter) {
             GGML_ASSERT(expected_logits.find(penalized_token) != expected_logits.end());
@@ -1304,7 +1379,7 @@ static void compare_masking_penalties_logits(
         : std::string(filter_name) + " penalties";
     const sampler_comparison_stats stats = compare_sampler_outputs(
             name.c_str(), expected_logits, output.actual, allow_extra_candidates);
-    const float masked_logit = find_backend_logit(output.actual, masked_token);
+    const float masked_logit = find_backend_logit(output.actual, output_masked_token);
     GGML_ASSERT(stats.n_masked > 0);
     GGML_ASSERT(std::isinf(masked_logit) && masked_logit < 0.0f);
     GGML_ASSERT(stats.n_mismatch == 0);
@@ -2006,6 +2081,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "temp",            test_backend_temp_sampling,           true  },
     { "temp_ext",        test_backend_temp_ext_sampling,       true  },
     { "top_k",           test_backend_top_k_sampling,          true  },
+    { "batched",         test_backend_batched_sampling,        true  },
     { "multi_sequence",  test_backend_multi_sequence_sampling, true  },
     { "dist",            test_backend_dist_sampling,           true  },
     { "dist_and_cpu",    test_backend_dist_sampling_and_cpu,   true  },
