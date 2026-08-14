@@ -1,0 +1,80 @@
+name: Publish muse.cpp server image
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: muse-server-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  server-cuda13:
+    name: CUDA 13 server (sm75, sm86, sm89)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Free disk space
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=server-cuda13
+            type=ref,event=tag,prefix=server-cuda13-
+            type=sha,prefix=server-cuda13-sha-
+          labels: |
+            org.opencontainers.image.title=muse.cpp server CUDA 13
+            org.opencontainers.image.description=Paged-KV llama-server with CUDA 13 support for sm75, sm86, and sm89
+
+      - name: Build and push server image
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294
+        with:
+          context: .
+          file: .devops/cuda.Dockerfile
+          target: server
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            CUDA_VERSION=13.3.0
+            CUDA_DOCKER_ARCH=75;86;89
+            CMAKE_EXTRA_ARGS=-DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_CUDA_COMPRESSION_MODE=size
+            APP_VERSION=${{ github.ref_name }}
+            APP_REVISION=${{ github.sha }}
+            IMAGE_URL=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=muse-server-cuda13
+          cache-to: type=gha,mode=max,scope=muse-server-cuda13
