@@ -23,7 +23,7 @@ Set with `--split-mode` / `-sm`.
 |---|---|---|
 | `none` | Use a single GPU only. Pick which one with `--main-gpu`. | You explicitly want to confine the model to one GPU even though more are visible. |
 | `layer` (**default**) | Pipeline parallelism. Each GPU holds a contiguous slice of layers. The KV cache for layer *l* lives on the GPU that owns layer *l*. | Default and most compatible multi-GPU choice. You want more memory than a single GPU provides and your priority is a fast prefill. Can tolerate slow interconnect speeds between GPUs. |
-| `row` | **Deprecated.** Older row-split tensor-parallel path with comparatively poor performance. Splits only dense weights across GPUs. Superseded by `tensor` which should be universally superior if it can be used. | Avoid in new deployments. |
+| `row` | **Deprecated.** Older row-split tensor-parallel path with comparatively poor performance. CUDA no longer implements its native split buffer. In paged server mode, backends without row support use `tensor` as a compatibility path. | Avoid in new deployments. |
 | `tensor` | **EXPERIMENTAL.** Tensor parallelism that splits both weights *and* KV across the participating GPUs via a "meta device" abstraction. | You want more memory than a single GPU provides and your priority is fast token generation. Prefill speeds approach pipeline parallel speeds for large, dense models and fast GPU interconnect speeds. Treat as experimental as the code is less mature than pipeline parallelism. Performance should be good for multiple NVIDIA GPUs using the CUDA backend, no guarantees otherwise. |
 
 > Pipeline parallel (`layer`) vs. tensor parallel (`tensor`): pipeline-parallel runs different layers on different GPUs and processes tokens sequentially through the pipeline. This minimizes data transfers between GPUs but requires many tokens to scale well. Tensor-parallel splits each layer across GPUs and does multiple cross-GPU reductions per layer. This enables parallelizing any workload but is much more bottlenecked by the GPU interconnect speed. Pipeline-parallel maximizes batch throughput; tensor-parallel minimizes latency.
@@ -43,7 +43,7 @@ Set with `--split-mode` / `-sm`.
 | `-fa` | `--flash-attn` | `on` \| `off` \| `auto` | `auto` | Required when using `--split-mode tensor` and/or quantized V cache. Supported (and therefore enabled by default) for most combinations of models and backends. |
 | `-ctk` | `--cache-type-k` | `f32` \| `f16` \| `bf16` \| `q8_0` \| `q4_0` \| ... | `f16` | KV cache type for K. |
 | `-ctv` | `--cache-type-v` | same as `-ctk` | `f16` | KV cache type for V. |
-| `-fit` | `--fit` | `on` \| `off` | `on` | Auto-fit unset args to device memory. **Not supported with `tensor`. You may need to manually set the `--ctx-size` to make the model fit.**  |
+| `-fit` | `--fit` | `on` \| `off` | `on` | Auto-fit unset args to device memory. Paged `tensor` mode measures each physical device and sizes the shared KV pool from the limiting local KV shard. General non-paged tensor auto-fit is not implemented. |
 
 As for any CUDA program, the environment variable `CUDA_VISIBLE_DEVICES` can be used to control which GPUs to use for the CUDA backend: if you set it, llama.cpp only sees the specified GPUs. Use `--device` for selecting GPUs from among those visible to llama.cpp, this works for any backend.
 
@@ -80,11 +80,11 @@ Use only the device listed as `CUDA1` when calling with `--list-devices`.
 ### 4. Tensor parallelism (experimental)
 
 ```bash
-llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
+llama-cli -m model.gguf -sm tensor -ctk q8_0 -ctv q8_0 -fa on
 ```
 
 - `--flash-attn off` or (`--flash-attn auto` resolving to `off` when it isn't supported) is a hard error.
-- KV cache types must be non-quantized: `f32`, `f16`, or `bf16`. Support for quantized KV cache is not implemented and trying to use it will result in an error.
+- Quantized K/V cache is supported by the CUDA Meta path. Validate output quality for each model and cache type.
 - Mark this configuration as experimental in your tooling: validate output quality before deploying.
 - `--split-mode tensor`is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"*:
 
@@ -94,7 +94,7 @@ llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
 
 ### 5. With NCCL
 
-There's no runtime flag for NCCL - it's selected at build time (`-DGGML_CUDA_NCCL=ON`, this is the default). Note that NCCL is **not** automatically distributed with CUDA and you may need to install it manually - when in doubt check the CMake log to see whether or not it can find the package. When llama.cpp is compiled with NCCL support it uses it automatically for cross-GPU reductions in `tensor` mode. When NCCL is missing on a multi-GPU build, you'll see this one-time warning and performance will be lower:
+NCCL is selected at build time (`-DGGML_CUDA_NCCL=ON`, this is the default). Two CUDA GPUs use the lower-latency internal AllReduce by default. Three or more CUDA GPUs use NCCL on Linux. Set `GGML_CUDA_ALLREDUCE=nccl` or `GGML_CUDA_ALLREDUCE=internal` to override the runtime choice.
 
 ```
 NVIDIA Collective Communications Library (NCCL) is unavailable, multi GPU performance will be suboptimal
@@ -118,10 +118,9 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs) 
 | Symptom | How to fix |
 |---|---|
 | Startup error *"SPLIT_MODE_TENSOR requires flash_attn to be enabled"* | Add `-fa on` or remove `-fa off`. |
-| Startup error *"simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented"* | Use `-ctk f16 -ctv f16` (or `bf16`/`f32`) with `--split-mode tensor`. |
 | Startup error *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'X'"* | Architecture not on the TENSOR allow-list. Use `--split-mode layer`. |
 | Warning *"NCCL is unavailable, multi GPU performance will be suboptimal"* | llama.cpp wasn't built with NCCL. Either accept the lower performance or install NCCL and rebuild. |
-| CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |
-| Performance is worse with multi-GPU than single-GPU | The performance is bottlenecked by GPU interconnect speed. For `--split-mode tensor`, verify that NCCL is being used. Try `--split-mode layer` (less communication than `tensor`). Increase GPU interconnect speed via more PCIe lanes or e.g. NVLink (if available). |
+| CUDA OOM at startup or during prefill in paged `--split-mode tensor` | Lower `--gpu-memory-utilization` or `--max-model-len`. The startup log reports the limiting device and the measured local KV shard size. |
+| Performance is worse with multi-GPU than single-GPU | The performance is bottlenecked by GPU interconnect speed. For two PCIe CUDA GPUs, try the default internal AllReduce. For NVLink, compare it with `GGML_CUDA_ALLREDUCE=nccl`. |
 | GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or you are accidentally hiding the GPUs via an environment variable like `CUDA_VISIBLE_DEVICES=-1`. Or your build doesn't include support for the relevant backend. |
 | Crashes or corrupted outputs after setting `GGML_CUDA_P2P=1` | Some motherboards and BIOS settings (e.g. with IOMMU enabled) don't support CUDA peer-to-peer reliably. Unset `GGML_CUDA_P2P`. |

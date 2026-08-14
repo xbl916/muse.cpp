@@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, int mixed_tile_ncols = 0> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -108,6 +108,15 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
 
     const int ic0 = blockIdx.x * ncols; // Index of the Q/QKV column to work on.
+
+    if constexpr (mixed_tile_ncols > 0) {
+        if (!block_table || !seq_ids_q || ic0 >= int(ne01.z)) {
+            return;
+        }
+        if (!fattn_paged_mixed_sequences(page_limits_q)) {
+            return;
+        }
+    }
 
     const int sequence = blockIdx.z / ne02;
     const int head = blockIdx.z - sequence*ne02;
@@ -264,7 +273,7 @@ static __global__ void flash_attn_ext_vec(
     if (paged) {
         const int seq_id = seq_ids_q && ic0 < int(ne01.z) ? seq_ids_q[ic0] : 0;
         seq_blocks = block_table + int64_t(seq_id) * max_pages;
-        page_start = page_limits_q ? max(0, page_limits_q[2*ic0 + 0]) : 0;
+        page_start = page_limits_q ? max(0, fattn_paged_page_start(page_limits_q, ic0)) : 0;
         page_end = page_limits_q ? min(max_pages, page_limits_q[2*ic0 + 1]) : max_pages;
     }
 
@@ -614,6 +623,29 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     } else {
         constexpr bool use_logit_softcap = true;
         ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+    }
+}
+
+template <int D, int mixed_tile_ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
+void ggml_cuda_flash_attn_ext_vec_mixed_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
+    const int nwarps = nthreads / WARP_SIZE;
+    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, 1, type_K, type_V, use_logit_softcap, mixed_tile_ncols>;
+    const bool need_f16_K = type_K == GGML_TYPE_F16;
+    const bool need_f16_V = type_V == GGML_TYPE_F16;
+    launch_fattn<D, 1, 1>(ctx, dst, fattn_kernel, nwarps, 0, D, need_f16_K, need_f16_V, false, WARP_SIZE, true);
+}
+
+template <int D, int mixed_tile_ncols, ggml_type type_K, ggml_type type_V>
+void ggml_cuda_flash_attn_ext_vec_mixed_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    float logit_softcap;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    if (logit_softcap == 0.0f) {
+        ggml_cuda_flash_attn_ext_vec_mixed_case_impl<D, mixed_tile_ncols, type_K, type_V, false>(ctx, dst);
+    } else {
+        ggml_cuda_flash_attn_ext_vec_mixed_case_impl<D, mixed_tile_ncols, type_K, type_V, true>(ctx, dst);
     }
 }
 

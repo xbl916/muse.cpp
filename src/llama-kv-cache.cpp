@@ -434,6 +434,7 @@ void llama_kv_cache::paged_release_seq(llama_seq_id seq_id) {
     const auto pages = *pages_ptr;
     auto & allocator = block_allocators[seq_to_stream[seq_id]];
     const auto & cells = v_cells[seq_to_stream[seq_id]];
+    std::vector<std::pair<uint32_t, uint32_t>> dead_pages;
     uint32_t n_tokens = 0;
 
     for (uint32_t page = 0; page < pages.size(); ++page) {
@@ -453,9 +454,12 @@ void llama_kv_cache::paged_release_seq(llama_seq_id seq_id) {
         }
 
         if (!live) {
-            block_table.erase_page(seq_id, page);
-            GGML_ASSERT(allocator.release(block));
+            dead_pages.emplace_back(page, block);
         }
+    }
+    for (auto it = dead_pages.rbegin(); it != dead_pages.rend(); ++it) {
+        block_table.erase_page(seq_id, it->first);
+        GGML_ASSERT(allocator.release(it->second));
     }
     GGML_ASSERT(block_table.set_n_tokens(seq_id, n_tokens));
 }
@@ -904,6 +908,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
         if (hparams.no_alloc) {
             GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
             ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+        } else if (ggml_backend_buffer_is_meta(buf.get())) {
+            const size_t n_buffers = ggml_backend_meta_buffer_n_buffers(buf.get());
+            for (size_t i = 0; i < n_buffers; ++i) {
+                ggml_backend_buffer_t simple = ggml_backend_meta_buffer_get_buffer(buf.get(), i);
+                ret[ggml_backend_buffer_get_type(simple)] += ggml_backend_buffer_get_size(simple);
+            }
         } else {
             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
             ret[buft] += ggml_backend_buffer_get_size(buf.get());
@@ -1449,7 +1459,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             for (int32_t q = 0; q < ubatch.n_seq_id[i]; q++) {
                 cells.seq_add(idx, ubatch.seq_id[i][q]);
-                paged_record_cell(sinfo.strm[s], idx, ubatch.seq_id[i][q], sinfo.lidxs[s][ii]);
+                if (paged) {
+                    paged_record_cell(sinfo.strm[s], idx, ubatch.seq_id[i][q], sinfo.lidxs[s][ii]);
+                }
             }
         }
     }
@@ -1839,6 +1851,14 @@ void llama_kv_cache::set_input_page_limits_q(ggml_tensor * dst, const llama_ubat
 
         data[2*i + 0] = std::min(page_start, page_end);
         data[2*i + 1] = page_end;
+    }
+
+    const llama_seq_id first_seq = ubatch->seq_id[0][0];
+    for (uint32_t i = 1; i < ubatch->n_tokens; ++i) {
+        if (ubatch->seq_id[i][0] != first_seq) {
+            data[0] = -data[0] - 1;
+            break;
+        }
     }
 }
 

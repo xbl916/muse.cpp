@@ -2088,7 +2088,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 continue;
             }
             const auto type = ggml_backend_dev_type(dev_layer(il));
-            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU && type != GGML_BACKEND_DEVICE_TYPE_META) {
                 throw std::runtime_error("paged KV requires all attention layers on GPU");
             }
         }

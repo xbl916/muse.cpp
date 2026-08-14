@@ -376,7 +376,9 @@ static constexpr __device__ int ggml_cuda_fattn_tile_get_nbatch_K(const int DKQ,
 // TODO: deduplicate with mma-f16
 template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
 static __device__ __forceinline__ void flash_attn_tile_load_tile(
-        const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
+        const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int stride_KV, const int i_sup,
+        const int * const __restrict__ seq_blocks = nullptr, const int logical_i0 = 0,
+        const int page_start = 0, const int page_end = 0, const int block_size = 0) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -405,9 +407,12 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
                     const int j = j0*cpy_ne + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*cpy_ne;
 
                     const __align__(16) half2 zero[cpy_ne] = {{0.0f, 0.0f}};
+                    const int physical_cell = seq_blocks && i < i_sup ? fattn_paged_physical_cell(
+                        seq_blocks, logical_i0 + i, page_start, page_end, block_size) : -1;
                     ggml_cuda_memcpy_1<cpy_nb>(
                         tile_KV + i*(J/2 + J_padding) + j,
-                        !oob_check || i < i_sup ? KV + i*stride_KV + j : zero);
+                        seq_blocks ? (physical_cell >= 0 ? KV + int64_t(physical_cell)*stride_KV + j : zero) :
+                        (!oob_check || i < i_sup ? KV + i*stride_KV + j : zero));
                 }
             }
         }
@@ -426,7 +431,9 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 
 template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
 static __device__ __forceinline__ void flash_attn_tile_load_tile(
-        const half2 * const __restrict__ KV, float * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
+        const half2 * const __restrict__ KV, float * const __restrict__ tile_KV, const int stride_KV, const int i_sup,
+        const int * const __restrict__ seq_blocks = nullptr, const int logical_i0 = 0,
+        const int page_start = 0, const int page_end = 0, const int block_size = 0) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -456,8 +463,11 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 
                     const half2 zero[cpy_ne/2] = {{0.0f, 0.0f}};
                     __align__(16) half2 tmp_h2[cpy_ne/2];
+                    const int physical_cell = seq_blocks && i < i_sup ? fattn_paged_physical_cell(
+                        seq_blocks, logical_i0 + i, page_start, page_end, block_size) : -1;
                     ggml_cuda_memcpy_1<sizeof(tmp_h2)>(
-                        tmp_h2, !oob_check || i < i_sup ? KV + i*stride_KV + j : zero);
+                        tmp_h2, seq_blocks ? (physical_cell >= 0 ? KV + int64_t(physical_cell)*stride_KV + j : zero) :
+                        (!oob_check || i < i_sup ? KV + i*stride_KV + j : zero));
 
                     __align__(16) float2 tmp_f2[cpy_ne/2];
 #pragma unroll
@@ -490,7 +500,11 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         const int k_VKQ_0,
         const int k_VKQ_sup,
         const int k_KQ_0,
-        float * KQ_acc) {
+        float * KQ_acc,
+        const int * const __restrict__ seq_blocks,
+        const int page_start,
+        const int page_end,
+        const int block_size) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -499,7 +513,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
 
     flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
-        (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
+        (K_h2 + (seq_blocks ? k_KQ_0/2 : int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2),
+         KV_tmp, stride_K2, k_VKQ_sup, seq_blocks, k_VKQ_0, page_start, page_end, block_size);
     __syncthreads();
 
 #ifdef FAST_FP16_AVAILABLE
@@ -575,7 +590,11 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         T_acc * const VKQ,
         const int k_VKQ_0,
         const int k_VKQ_max,
-        const int col_Q_0) {
+        const int col_Q_0,
+        const int * const __restrict__ seq_blocks,
+        const int page_start,
+        const int page_end,
+        const int block_size) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -608,12 +627,14 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>(
-            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc,
+            seq_blocks, page_start, page_end, block_size);
     }
     if (nbatch_K_last > 0) {
         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check>(
-            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc,
+            seq_blocks, page_start, page_end, block_size);
     }
 
     // Apply logit softcap + mask, update KQ_max:
@@ -636,8 +657,14 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             }
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
-                KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
-                    slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
+                const int physical_cell = seq_blocks ? fattn_paged_physical_cell(
+                    seq_blocks, k_VKQ_0 + i_KQ, page_start, page_end, block_size) : -1;
+                if (seq_blocks && physical_cell < 0) {
+                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = -FLT_MAX/2.0f;
+                } else if (ncols2 > 1 || mask) {
+                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += slope*__half2float(
+                        mask[j*stride_mask + (seq_blocks ? physical_cell : k_VKQ_0 + i_KQ)]);
+                }
 
                 KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
             }
@@ -719,7 +746,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 #pragma unroll
     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
         flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
-            (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
+            (seq_blocks ? V_h2 : V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2,
+             KV_tmp, stride_V2, k_VKQ_sup - k0,
+             seq_blocks, k_VKQ_0 + k0, page_start, page_end, block_size);
         __syncthreads();
 
 #ifdef FAST_FP16_AVAILABLE
@@ -818,7 +847,6 @@ static __global__ void flash_attn_tile(
         const int32_t max_pages,
         const int32_t block_size) {
 #ifdef FLASH_ATTN_AVAILABLE
-    GGML_UNUSED_VARS(block_table, seq_ids_q, page_limits_q, max_pages, block_size);
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
     const char * GGML_CUDA_RESTRICT V        = V_ptr;
@@ -859,9 +887,15 @@ static __global__ void flash_attn_tile(
     const int sequence = blockIdx.z / (ne02/ncols2);
     const int head0 = blockIdx.z*ncols2 - sequence*ne02; // == blockIdx.z % (ne02/ncols2)
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+    const bool paged = block_table != nullptr;
+    const int q_index = sequence*int(ne01.z) + col_Q_0;
+    const int seq_id = paged ? seq_ids_q[q_index] : 0;
+    const int page_start = paged ? max(0, fattn_paged_page_start(page_limits_q, q_index)) : 0;
+    const int page_end = paged ? min(max_pages, page_limits_q[2*q_index + 1]) : 0;
+    const int * seq_blocks = paged ? block_table + int64_t(seq_id)*max_pages : nullptr;
     const float * Q_f  = (const float *) (Q + nb03*sequence + nb02* head0);
-    const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
-    const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
+    const half2 * K_h2 = (const half2 *) (K + (paged ? 0 : nb13*sequence) + nb12*(head0 / gqa_ratio));
+    const half2 * V_h2 = (const half2 *) (V + (paged ? 0 : nb23*sequence) + nb22*(head0 / gqa_ratio)); // K and V have same shape
 
     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
 
@@ -957,30 +991,34 @@ static __global__ void flash_attn_tile(
     __syncthreads();
 
     // Main loop over KV cache:
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    const int k_VKQ_max = paged ? page_end*block_size : (KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11);
     if (ncols2 == 1) {
         // Branch with out-of-bounds checks.
-        int k_VKQ_0 = blockIdx.y*nbatch_fa;
+        int k_VKQ_0 = (paged ? page_start*block_size : 0) + blockIdx.y*nbatch_fa;
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
+                seq_blocks, page_start, page_end, block_size);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
+                seq_blocks, page_start, page_end, block_size);
         }
     } else {
         // Branch without out-of-bounds checks.
-        for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+        for (int k_VKQ_0 = (paged ? page_start*block_size : 0) + blockIdx.y*nbatch_fa;
+                k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
+                seq_blocks, page_start, page_end, block_size);
         }
     }
 
@@ -1239,6 +1277,15 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     GGML_ABORT("fatal error");
 }
 
+template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
+static void launch_fattn_tile_paged(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int nwarps = ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols2, cc) / 32;
+    const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols2, cc);
+    fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, 1, ncols2, use_logit_softcap>;
+    launch_fattn<DV, 1, ncols2>(ctx, dst, fattn_kernel, nwarps, 0, nbatch_fa, true, true, false, 32);
+}
+
 template <int DKQ, int DV, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
@@ -1251,6 +1298,23 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    if (dst->src[5]) {
+        if constexpr (DKQ == 320) {
+            launch_fattn_tile_paged<DKQ, DV, 16, use_logit_softcap>(ctx, dst);
+        } else if constexpr (DKQ == 576) {
+            launch_fattn_tile_paged<DKQ, DV, 4, use_logit_softcap>(ctx, dst);
+        } else {
+            if (gqa_ratio % 8 == 0) {
+                launch_fattn_tile_paged<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
+            } else if (gqa_ratio % 4 == 0) {
+                launch_fattn_tile_paged<DKQ, DV, 4, use_logit_softcap>(ctx, dst);
+            } else {
+                launch_fattn_tile_paged<DKQ, DV, 2, use_logit_softcap>(ctx, dst);
+            }
+        }
+        return;
+    }
 
     // On NVIDIA (Pascal and older) the GQA optimizations seem to be detrimental in some cases.
     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.

@@ -55,6 +55,31 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
+static __device__ __forceinline__ bool fattn_paged_mixed_sequences(const int * __restrict__ page_limits_q) {
+    return page_limits_q && page_limits_q[0] < 0;
+}
+
+static __device__ __forceinline__ int fattn_paged_page_start(
+        const int * __restrict__ page_limits_q, const int q_index) {
+    const int value = page_limits_q[2*q_index];
+    return q_index == 0 && value < 0 ? -value - 1 : value;
+}
+
+static __device__ __forceinline__ int fattn_paged_physical_cell(
+        const int * __restrict__ seq_blocks,
+        const int logical_cell,
+        const int page_start,
+        const int page_end,
+        const int block_size) {
+    const int page = logical_cell / block_size;
+    if (page < page_start || page >= page_end) {
+        return -1;
+    }
+
+    const int block = seq_blocks[page];
+    return block >= 0 ? block*block_size + logical_cell - page*block_size : -1;
+}
+
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
@@ -916,13 +941,19 @@ static __global__ void flash_attn_stream_k_fixup_general(
     *dst = dst_val / rowsum;
 }
 
-template<int D> // D == head size
+template<int D, bool mixed_only = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_combine_results(
         const float  * VKQ_parts_ptr,
         const float2 * VKQ_meta_ptr,
         float * dst_ptr,
-        const int parallel_blocks) {
+        const int parallel_blocks,
+        const int * page_limits_q) {
+    if constexpr (mixed_only) {
+        if (!fattn_paged_mixed_sequences(page_limits_q)) {
+            return;
+        }
+    }
     ggml_cuda_pdl_lc();
     const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
     const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
@@ -977,7 +1008,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const bool combine_mixed_only = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1133,35 +1165,41 @@ void launch_fattn(
 
     dim3 blocks_num;
     if (stream_k) {
-        // For short contexts it can be faster to have the SMs work on whole tiles because this lets us skip the fixup.
-        const int max_blocks = max_blocks_per_sm*nsm;
-        const int tiles_nwaves = (ntiles_dst + max_blocks - 1) / max_blocks;
-        const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
+        if (block_table) {
+            blocks_num.x = ntiles_dst;
+            blocks_num.y = 1;
+            blocks_num.z = 1;
+        } else {
+            // For short contexts it can be faster to have the SMs work on whole tiles because this lets us skip the fixup.
+            const int max_blocks = max_blocks_per_sm*nsm;
+            const int tiles_nwaves = (ntiles_dst + max_blocks - 1) / max_blocks;
+            const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
-        const bool use_stream_k = cc >= GGML_CUDA_CC_ADA_LOVELACE || amd_wmma_available(cc) || tiles_efficiency_percent < 75;
+            const bool use_stream_k = cc >= GGML_CUDA_CC_ADA_LOVELACE || amd_wmma_available(cc) || tiles_efficiency_percent < 75;
 
-        blocks_num.x = ntiles_dst;
-        blocks_num.y = 1;
-        blocks_num.z = 1;
+            blocks_num.x = ntiles_dst;
+            blocks_num.y = 1;
+            blocks_num.z = 1;
 
-        if(use_stream_k) {
-            const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
-            // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
-            // Only do this if the occupancy loss from rounding is acceptable.
-            const int nblocks_stream_k_rounded = (nblocks_stream_k_raw / ntiles_dst) * ntiles_dst;
-            const int max_efficiency_loss_percent = 5;
-            const int efficiency_loss_percent = nblocks_stream_k_rounded > 0
-                ? 100 * (nblocks_stream_k_raw - nblocks_stream_k_rounded) / nblocks_stream_k_raw
-                : 100;
-            const int nblocks_stream_k = efficiency_loss_percent <= max_efficiency_loss_percent
-                ? nblocks_stream_k_rounded
-                : nblocks_stream_k_raw;
+            if(use_stream_k) {
+                const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
+                // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
+                // Only do this if the occupancy loss from rounding is acceptable.
+                const int nblocks_stream_k_rounded = (nblocks_stream_k_raw / ntiles_dst) * ntiles_dst;
+                const int max_efficiency_loss_percent = 5;
+                const int efficiency_loss_percent = nblocks_stream_k_rounded > 0
+                    ? 100 * (nblocks_stream_k_raw - nblocks_stream_k_rounded) / nblocks_stream_k_raw
+                    : 100;
+                const int nblocks_stream_k = efficiency_loss_percent <= max_efficiency_loss_percent
+                    ? nblocks_stream_k_rounded
+                    : nblocks_stream_k_raw;
 
-            blocks_num.x = nblocks_stream_k;
-        }
+                blocks_num.x = nblocks_stream_k;
+            }
 
-        if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
-            dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
+            if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
+                dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
+            }
         }
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
@@ -1283,8 +1321,13 @@ void launch_fattn(
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+        if (combine_mixed_only) {
+            ggml_cuda_kernel_launch(flash_attn_combine_results<DV, true>, launch_params,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, page_limits_q);
+        } else {
+            ggml_cuda_kernel_launch(flash_attn_combine_results<DV, false>, launch_params,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks, page_limits_q);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

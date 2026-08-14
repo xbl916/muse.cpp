@@ -472,6 +472,14 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
     return buf_ctx->bufs[index].get();
 }
 
+size_t ggml_backend_meta_buffer_n_buffers(ggml_backend_buffer_t buffer) {
+    return ggml_backend_meta_buffer_n_bufs(buffer);
+}
+
+ggml_backend_buffer_t ggml_backend_meta_buffer_get_buffer(ggml_backend_buffer_t buffer, size_t index) {
+    return ggml_backend_meta_buffer_simple_buffer(buffer, index);
+}
+
 static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
@@ -752,6 +760,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(tensor->src[4] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        GGML_ASSERT(tensor->src[5] == nullptr || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(tensor->src[6] == nullptr || src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(tensor->src[7] == nullptr || src_ss[7].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
 

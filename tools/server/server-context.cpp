@@ -1092,6 +1092,8 @@ private:
         mtmd_context_params mparams = mtmd_context_params_default();
         if (has_mmproj) {
             mparams.use_gpu          = params_base.mmproj_use_gpu;
+            mparams.tensor_parallel  = params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR;
+            mparams.devices         = params_base.devices.empty() ? nullptr : params_base.devices.data();
             mparams.print_timings    = false;
             mparams.n_threads        = params_base.cpuparams.n_threads;
             mparams.flash_attn_type  = params_base.flash_attn_type;
@@ -1621,6 +1623,30 @@ private:
                     reserved += max_pages - used_pages;
                 }
             }
+        } else {
+            for (const auto & slot : slots) {
+                if (&slot == &selected || !slot.task) {
+                    continue;
+                }
+
+                uint32_t used_pages = 0;
+                if (slot.state == SLOT_STATE_STARTED) {
+                    const uint32_t active_prefix_tokens = slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+                    used_pages = (active_prefix_tokens + block_size - 1) / block_size;
+                } else if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                    used_pages = (slot.prompt.tokens.size() + block_size - 1) / block_size;
+                } else {
+                    continue;
+                }
+
+                const uint32_t active_prompt_pages = (slot.task->tokens.size() + block_size - 1) / block_size;
+                if (active_prompt_pages > used_pages) {
+                    reserved += active_prompt_pages - used_pages;
+                }
+                if (slot.task->tokens.size() % block_size == 0) {
+                    reserved++;
+                }
+            }
         }
 
         auto available = [&]() {
@@ -1640,6 +1666,8 @@ private:
             }
 
             if (!victim) {
+                SRV_DBG("paged KV admission deferred, needed = %u, available = %u, free = %u, reserved = %u, reclaimable = %u\n",
+                        needed, available(), llama_memory_n_free_blocks(memory), reserved, reclaimable);
                 return false;
             }
 
@@ -1742,7 +1770,6 @@ private:
 
         if (ret) {
             if (!ensure_paged_capacity(task, *ret)) {
-                SRV_DBG("paged KV admission deferred, free_blocks = %u\n", llama_memory_n_free_blocks(llama_get_memory(ctx_tgt)));
                 return nullptr;
             }
 
@@ -3196,6 +3223,18 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        int32_t prompt_batch_limit = n_batch;
+        if (params_base.scheduler == "paged" && !generating.empty() && params_base.paged_prefill_chunk > 0) {
+            prompt_batch_limit = std::min(n_batch, batch.size() + params_base.paged_prefill_chunk);
+        }
+
+        int32_t n_prompt_slots = 0;
+        for (const auto & slot : slots) {
+            n_prompt_slots += slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED;
+        }
+        const int32_t prompt_slot_limit = n_prompt_slots > 0 ?
+            std::max(1, (prompt_batch_limit - batch.size() + n_prompt_slots - 1) / n_prompt_slots) : 0;
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -3204,7 +3243,7 @@ private:
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= prompt_batch_limit) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -3600,7 +3639,9 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() &&
+                            batch.size() < prompt_batch_limit &&
+                            batch.size() - n_tokens_prev < prompt_slot_limit) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

@@ -78,6 +78,20 @@ static void server_apply_paged_memory_target(common_params & params) {
     }
 }
 
+static bool server_devices_support_row(const common_params & params) {
+    const auto devices = server_get_fit_devices(params);
+    if (devices.empty()) {
+        return false;
+    }
+    for (ggml_backend_dev_t dev : devices) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (!reg || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type")) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // satisfies -Wmissing-declarations (used by llama command)
 int llama_server(int argc, char ** argv);
 
@@ -193,14 +207,20 @@ int llama_server(common_params & params, int argc, char ** argv) {
         const bool parallel_auto = params.n_parallel < 0;
 
         if (params.scheduler == "paged") {
-            if (params.split_mode == LLAMA_SPLIT_MODE_ROW || params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-                SRV_ERR("%s", "paged scheduler supports only split-mode layer or none\n");
-                return 1;
+            if (params.split_mode == LLAMA_SPLIT_MODE_ROW && !server_devices_support_row(params)) {
+                SRV_WRN("%s", "split-mode row is unavailable on the selected backend; using tensor parallelism for paged KV\n");
+                params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
             }
 
             params.paged_kv = true;
             params.kv_unified = true;
             params.fit_params = true;
+            if (!params.cache_idle_slots_explicit) {
+                params.cache_idle_slots = false;
+            }
+            if (!params.cache_ram_explicit) {
+                params.cache_ram_mib = 0;
+            }
             if (params.n_gpu_layers == -1) {
                 params.n_gpu_layers = -2;
             }
@@ -234,9 +254,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
             params.n_ctx = 0;
             server_apply_paged_memory_target(params);
 
-            SRV_INF("paged scheduler enabled: block_size=%d max_model_len=%d max_num_seqs=%d admission=%s prefix_cache=%s\n",
+            SRV_INF("paged scheduler enabled: block_size=%d max_model_len=%d max_num_seqs=%d admission=%s prefix_cache=%s prefill_chunk=%d\n",
                     params.kv_block_size, params.max_model_len, params.n_parallel_max,
-                    params.paged_admission.c_str(), params.kv_prefix_cache ? "on" : "off");
+                    params.paged_admission.c_str(), params.kv_prefix_cache ? "on" : "off", params.paged_prefill_chunk);
         } else if (params.n_parallel < 0) {
             SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
 

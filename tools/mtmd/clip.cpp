@@ -143,6 +143,62 @@ static void clip_image_convert_f32_to_u8(const clip_image_f32& src, clip_image_u
 }
 #endif
 
+struct clip_meta_split_userdata {
+    size_t n_devices = 0;
+};
+
+static ggml_backend_meta_split_state clip_meta_get_split_state(const ggml_tensor * tensor, void * userdata) {
+    const auto * ud = static_cast<const clip_meta_split_userdata *>(userdata);
+    ggml_backend_meta_split_state result = {};
+    result.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    result.nr[0] = 1;
+    result.n_segments = 1;
+
+    const std::string name = tensor->name;
+    const bool qkv_weight = name.find(".attn_qkv.weight") != std::string::npos;
+    const bool qkv_bias   = name.find(".attn_qkv.bias")   != std::string::npos;
+
+    int axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    int64_t segment_size = 0;
+    uint32_t segment_repeats = 1;
+    int64_t granularity = 8;
+
+    if (qkv_weight || qkv_bias) {
+        axis = qkv_weight ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0;
+        if (tensor->ne[axis] % 3 != 0) {
+            return result;
+        }
+        segment_size = tensor->ne[axis] / 3;
+        segment_repeats = 3;
+        granularity = 8;
+    } else if (name.find(".ffn_up.weight") != std::string::npos || name == "mm.0.weight") {
+        axis = GGML_BACKEND_SPLIT_AXIS_1;
+    } else if (name.find(".ffn_up.bias") != std::string::npos || name == "mm.0.bias") {
+        axis = GGML_BACKEND_SPLIT_AXIS_0;
+    } else if (name.find(".attn_out.weight") != std::string::npos ||
+               name.find(".ffn_down.weight") != std::string::npos ||
+               name == "mm.2.weight") {
+        axis = GGML_BACKEND_SPLIT_AXIS_0;
+    } else {
+        return result;
+    }
+
+    result.axis = static_cast<ggml_backend_meta_split_axis>(axis);
+    segment_size = segment_size > 0 ? segment_size : tensor->ne[axis];
+    result.nr[0] = segment_repeats;
+    result.n_segments = 1;
+
+    int64_t low = 0;
+    for (size_t i = 0; i + 1 < ud->n_devices; ++i) {
+        int64_t high = segment_size * (i + 1) / ud->n_devices;
+        high -= high % granularity;
+        result.ne[i] = high - low;
+        low = high;
+    }
+    result.ne[ud->n_devices - 1] = segment_size - low;
+    return result;
+}
+
 
 struct clip_ctx {
     clip_model model;
@@ -158,6 +214,9 @@ struct clip_ctx {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_buffer_ptr buf;
+
+    std::vector<ggml_backend_dev_t> devices;
+    clip_meta_split_userdata split_userdata;
 
 
     int max_nodes = 8192;
@@ -191,6 +250,30 @@ struct clip_ctx {
                 backend = ggml_backend_init_by_name(backend_name, nullptr);
                 if (!backend) {
                     LOG_WRN("%s: Warning: Failed to initialize \"%s\" backend, falling back to default GPU backend\n", __func__, backend_name);
+                }
+            }
+            if (!backend && ctx_params.tensor_parallel) {
+                if (ctx_params.devices != nullptr) {
+                    for (auto ** dev = ctx_params.devices; *dev != nullptr; ++dev) {
+                        devices.push_back(*dev);
+                    }
+                } else {
+                    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                        auto * dev = ggml_backend_dev_get(i);
+                        const auto type = ggml_backend_dev_type(dev);
+                        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                            devices.push_back(dev);
+                        }
+                    }
+                }
+
+                if (devices.size() > 1) {
+                    split_userdata.n_devices = devices.size();
+                    auto * meta_dev = ggml_backend_meta_device(
+                        devices.data(), devices.size(), clip_meta_get_split_state, &split_userdata);
+                    backend = ggml_backend_dev_init(meta_dev, nullptr);
+                } else if (devices.size() == 1) {
+                    backend = ggml_backend_dev_init(devices[0], nullptr);
                 }
             }
             if (!backend) {
@@ -2057,7 +2140,9 @@ struct clip_model_loader {
                 loaded_tensor_names.insert(name);
                 cur = data_tensor;
                 // add to weight memory counter
-                ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend)] += ggml_nbytes(cur);
+                if (!ggml_backend_buft_is_meta(ggml_backend_get_default_buffer_type(ctx_clip.backend))) {
+                    ctx_clip.mem_usage[ggml_backend_get_device(ctx_clip.backend)] += ggml_nbytes(cur);
+                }
             }
             return cur;
         };
@@ -3472,6 +3557,14 @@ struct clip_model_loader {
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            if (ggml_backend_buffer_is_meta(ctx_clip.buf.get())) {
+                const size_t n_buffers = ggml_backend_meta_buffer_n_buffers(ctx_clip.buf.get());
+                for (size_t i = 0; i < n_buffers; ++i) {
+                    auto * buffer = ggml_backend_meta_buffer_get_buffer(ctx_clip.buf.get(), i);
+                    auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
+                    ctx_clip.mem_usage[dev] += ggml_backend_buffer_get_size(buffer);
+                }
+            }
             // read the weight from file
             if (!ctx_clip.no_alloc) {
                 size_t data_loaded = 0;
@@ -3646,7 +3739,13 @@ struct clip_model_loader {
                         ggml_backend_buft_name(buft),
                         size / 1024.0 / 1024.0);
             }
-            ctx_clip.mem_compute[ggml_backend_get_device(backend)] += size;
+            if (ggml_backend_buft_is_meta(buft)) {
+                for (auto * dev : ctx_clip.devices) {
+                    ctx_clip.mem_compute[dev] += size;
+                }
+            } else {
+                ctx_clip.mem_compute[ggml_backend_get_device(backend)] += size;
+            }
         }
 
         const int n_splits = ggml_backend_sched_get_n_splits(ctx_clip.sched.get());

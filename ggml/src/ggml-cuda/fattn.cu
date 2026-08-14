@@ -33,6 +33,39 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
 }
 
+template <int DKQ, int DV, int ncols1>
+static void ggml_cuda_flash_attn_ext_mma_f16_mixed_fallback(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if constexpr (DKQ == 256 && DV == 256) {
+        const ggml_type type_K = dst->src[1]->type;
+        const ggml_type type_V = dst->src[2]->type;
+        if (type_K == GGML_TYPE_Q4_0 && type_V == GGML_TYPE_Q4_0) {
+            ggml_cuda_flash_attn_ext_vec_mixed_case<DKQ, ncols1, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
+        } else {
+            GGML_ASSERT(type_K == GGML_TYPE_Q5_0 && type_V == GGML_TYPE_Q5_0);
+            ggml_cuda_flash_attn_ext_vec_mixed_case<DKQ, ncols1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0>(ctx, dst);
+        }
+    }
+}
+
+template <int DKQ, int DV, int ncols2>
+static void ggml_cuda_flash_attn_ext_mma_f16_paged_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const ggml_tensor * Q = dst->src[0];
+
+    if (Q->ne[1] == 1) {
+        constexpr int ncols1 = 8/ncols2;
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, ncols1, ncols2>(ctx, dst);
+    } else if (ampere_mma_available(cc)) {
+        constexpr int ncols1 = 64/ncols2;
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, ncols1, ncols2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_mixed_fallback<DKQ, DV, ncols1>(ctx, dst);
+    } else {
+        constexpr int ncols1 = 32/ncols2;
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, ncols1, ncols2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_mixed_fallback<DKQ, DV, ncols1>(ctx, dst);
+    }
+}
+
 template <int DKQ, int DV>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -41,6 +74,21 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+
+    if (dst->src[5]) {
+        GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+        const int gqa_ratio = Q->ne[2] / K->ne[2];
+        if (gqa_ratio % 8 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_paged_case<DKQ, DV, 8>(ctx, dst);
+        } else if (gqa_ratio % 4 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_paged_case<DKQ, DV, 4>(ctx, dst);
+        } else if (gqa_ratio % 2 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_paged_case<DKQ, DV, 2>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_f16_paged_case<DKQ, DV, 1>(ctx, dst);
+        }
+        return;
+    }
 
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
@@ -148,6 +196,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             GGML_ASSERT(use_gqa_opt);
             GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
             const int gqa_ratio = Q->ne[2] / K->ne[2];
+            if (dst->src[5]) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<192, 128, 1, 8>(ctx, dst);
+                break;
+            }
             if (gqa_ratio % 16 == 0) {
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<192, 128, 16>(ctx, dst);
             } else {
@@ -172,6 +224,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                 const int gqa_ratio = Q->ne[2] / K->ne[2];
                 GGML_ASSERT(gqa_ratio % 32 == 0);
 
+                if (dst->src[5]) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<320, 256, 1, 32>(ctx, dst);
+                    break;
+                }
+
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<320, 256, 32>(ctx, dst);
             }
             break;
@@ -190,6 +247,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 
             GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
             const int gqa_ratio = Q->ne[2] / K->ne[2];
+            if (dst->src[5]) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<576, 512, 1, 16>(ctx, dst);
+                break;
+            }
             if (gqa_ratio == 20) { // GLM 4.7 Flash
                 if (cc >= GGML_CUDA_CC_DGX_SPARK) {
                     if (Q->ne[1] <= 8) {
@@ -463,6 +524,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     if (block_table) {
+        const int quant_mma_min_queries = ampere_mma_available(cc) ? 32 : 16;
+        const bool quant_mma_type = (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) ||
+            (K->type == GGML_TYPE_Q5_0 && V->type == GGML_TYPE_Q5_0);
+        const bool quant_mma = quant_mma_type &&
+            turing_mma_available(cc) && Q->ne[0] == 256 && Q->ne[1] >= quant_mma_min_queries && gqa_ratio % 2 == 0;
+        if (quant_mma) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+        const bool f16_tiles = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+        const int tile_gqa = Q->ne[0] == 320 ? 16 : (Q->ne[0] == 576 ? 4 : 2);
+        if (f16_tiles && gqa_ratio % tile_gqa == 0) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
         return can_use_vector_kernel ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
     }
 
@@ -558,9 +632,13 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            need_f16_K = !(dst->src[5] && K->type == V->type &&
+                (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q5_0));
+            need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC:
             need_f16_K = K->type == GGML_TYPE_F32;

@@ -404,6 +404,11 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    GGML_API bool                  ggml_backend_buffer_is_meta(ggml_backend_buffer_t buffer);
+    GGML_API bool                  ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft);
+    GGML_API size_t                ggml_backend_meta_buffer_n_buffers(ggml_backend_buffer_t buffer);
+    GGML_API ggml_backend_buffer_t ggml_backend_meta_buffer_get_buffer(ggml_backend_buffer_t buffer, size_t index);
+
     //
     // Utils
     //

@@ -1699,6 +1699,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
             params.cache_ram_mib = value;
+            params.cache_ram_explicit = true;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
@@ -1750,6 +1751,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_BLOCK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--paged-prefill-chunk"}, "N",
+        string_format("maximum prompt tokens scheduled while requests are generating (default: %d, 0 = disabled)", params.paged_prefill_chunk),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("paged prefill chunk must be non-negative");
+            }
+            params.paged_prefill_chunk = value;
+        }
+    ).set_env("LLAMA_ARG_PAGED_PREFILL_CHUNK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--max-model-len"}, "N",
         "maximum context length for one paged request",
         [](common_params & params, int value) {
@@ -1780,9 +1791,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
-        "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
+        "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled for slots, disabled for paged; requires cache-ram)",
         [](common_params & params, bool value) {
             params.cache_idle_slots = value;
+            params.cache_idle_slots_explicit = true;
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(

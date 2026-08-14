@@ -89,6 +89,8 @@ typedef bool (*mtmd_progress_callback)(float progress, void * user_data);
 
 struct mtmd_context_params {
     bool use_gpu;
+    bool tensor_parallel;
+    ggml_backend_dev_t * devices;
     bool print_timings;
     int n_threads;
     const char * image_marker; // deprecated, use media_marker instead

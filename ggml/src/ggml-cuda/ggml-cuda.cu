@@ -1221,7 +1221,11 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
 
     const char * env = getenv("GGML_CUDA_ALLREDUCE");
     if (!env) {
-        // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
+        // The internal path has lower latency for two PCIe GPUs.
+        if (n_backends == 2) {
+            ggml_backend_cuda_comm_init_internal(ret);
+            return ret;
+        }
 #if defined(__linux__)
         ggml_backend_cuda_comm_init_nccl(ret);
 #else
