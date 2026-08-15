@@ -396,16 +396,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
-                    if constexpr (type_KV == GGML_TYPE_Q4_0 || type_KV == GGML_TYPE_Q5_0) {
+                    if constexpr (type_KV == GGML_TYPE_Q4_0 || type_KV == GGML_TYPE_Q5_0 || type_KV == GGML_TYPE_Q5_1) {
                         __align__(16) half tmp[8] = {};
                         if (physical_cell >= 0) {
                             const char * row = (const char *) KV + int64_t(physical_cell)*stride_KV;
                             if constexpr (type_KV == GGML_TYPE_Q4_0) {
                                 dequantize_V_q4_0<half, 4>(row, tmp + 0, element_offset + 2*k*h2_per_chunk + 0);
                                 dequantize_V_q4_0<half, 4>(row, tmp + 4, element_offset + 2*k*h2_per_chunk + 4);
-                            } else {
+                            } else if constexpr (type_KV == GGML_TYPE_Q5_0) {
                                 dequantize_V_q5_0<half, 4>(row, tmp + 0, element_offset + 2*k*h2_per_chunk + 0);
                                 dequantize_V_q5_0<half, 4>(row, tmp + 4, element_offset + 2*k*h2_per_chunk + 4);
+                            } else {
+                                dequantize_V_q5_1<half, 4>(row, tmp + 0, element_offset + 2*k*h2_per_chunk + 0);
+                                dequantize_V_q5_1<half, 4>(row, tmp + 4, element_offset + 2*k*h2_per_chunk + 4);
                             }
                         }
                         ggml_cuda_memcpy_1<16>(tile_KV + i*stride_tile + k*4, tmp);
@@ -2072,8 +2075,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
     const bool paged_q4_0 = dst->src[5] && K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0;
     const bool paged_q5_0 = dst->src[5] && K->type == GGML_TYPE_Q5_0 && V->type == GGML_TYPE_Q5_0;
-    const bool paged_quant = paged_q4_0 || paged_q5_0;
-    const int paged_type_index = paged_q4_0 ? 1 : (paged_q5_0 ? 2 : 0);
+    const bool paged_q5_1 = dst->src[5] && K->type == GGML_TYPE_Q5_1 && V->type == GGML_TYPE_Q5_1;
+    const bool paged_quant = paged_q4_0 || paged_q5_0 || paged_q5_1;
+    const int paged_type_index = paged_q4_0 ? 1 : (paged_q5_0 ? 2 : (paged_q5_1 ? 3 : 0));
 
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
     const size_t nbytes_shared_KV_2stage = nbatch_fa            *         (nbatch_K2 + 4 + nbatch_V2 + 4) * sizeof(half2);
@@ -2105,7 +2109,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 ((ncols1 == 32 || ncols1 == 64) && ncols2 == 1)) {
             fattn_kernel = paged_q4_0 ?
                 flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, GGML_TYPE_Q4_0> : paged_q5_0 ?
-                flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, GGML_TYPE_Q5_0> :
+                flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, GGML_TYPE_Q5_0> : paged_q5_1 ?
+                flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, GGML_TYPE_Q5_1> :
                 flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, GGML_TYPE_F16>;
         } else {
             GGML_ASSERT(!paged_quant);
@@ -2113,7 +2118,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         }
 
 #if !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[3][GGML_CUDA_MAX_DEVICES] = {{false}};
+        static bool shared_memory_limit_raised[4][GGML_CUDA_MAX_DEVICES] = {{false}};
         if (!shared_memory_limit_raised[paged_type_index][id]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
             shared_memory_limit_raised[paged_type_index][id] = true;
@@ -2128,7 +2133,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 ((ncols1 == 32 || ncols1 == 64) && ncols2 == 1)) {
             fattn_kernel = paged_q4_0 ?
                 flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, GGML_TYPE_Q4_0> : paged_q5_0 ?
-                flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, GGML_TYPE_Q5_0> :
+                flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, GGML_TYPE_Q5_0> : paged_q5_1 ?
+                flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, GGML_TYPE_Q5_1> :
                 flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, GGML_TYPE_F16>;
         } else {
             GGML_ASSERT(!paged_quant);
@@ -2136,7 +2142,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         }
 
 #if !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[3][GGML_CUDA_MAX_DEVICES] = {{false}};
+        static bool shared_memory_limit_raised[4][GGML_CUDA_MAX_DEVICES] = {{false}};
         if (!shared_memory_limit_raised[paged_type_index][id]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
             shared_memory_limit_raised[paged_type_index][id] = true;
