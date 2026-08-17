@@ -537,7 +537,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = n_outputs > 0 ? build_inp_out_ids() : nullptr;
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -762,6 +762,35 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
+
+    // Prompt catch-up batches do not produce draft tokens. They only need to
+    // populate the MTP layer's cache so later draft steps can attend to the
+    // prompt. Avoid computing Q, attention, FFN, and the output head for rows
+    // whose outputs are discarded.
+    if (n_outputs == 0) {
+        const auto * mctx_kv = static_cast<const llama_kv_cache_context *>(mctx);
+
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+        if (inp_attn->self_k_rot) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+        }
+        if (inp_attn->self_v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+        }
+
+        ggml_build_forward_expand(gf, mctx_kv->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, mctx_kv->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+        return;
+    }
 
     ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
     cb(Qcur_full, "mtp_Qcur_full", il);

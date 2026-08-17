@@ -238,6 +238,14 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(out_ids);
 
+    // Graphs that only have side effects (for example an MTP prompt catch-up
+    // pass that only fills K/V) can leave the zero-length output-id input
+    // unallocated. There is nothing to upload in that case.
+    if (!out_ids->buffer) {
+        GGML_ASSERT(n_outputs == 0);
+        return;
+    }
+
     const int64_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
@@ -545,10 +553,16 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
-    res &= !self_seq_ids_q || self_seq_ids_q->ne[0] == params.ubatch.n_tokens;
-    res &= !self_page_limits_q || self_page_limits_q->ne[1] == params.ubatch.n_tokens;
-    res &= !self_block_table || self_block_table->ne[0] >= mctx->get_block_table_max_mapped_page_plus1();
+    // A side-effect-only KV fill graph does not allocate or consume the
+    // attention mask. Its topology is independent of the growing KV length,
+    // so do not force a graph rebuild for every prompt chunk.
+    const bool kv_fill_only = !self_kq_mask || !self_kq_mask->buffer;
+    if (!kv_fill_only) {
+        res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+        res &= !self_seq_ids_q || self_seq_ids_q->ne[0] == params.ubatch.n_tokens;
+        res &= !self_page_limits_q || self_page_limits_q->ne[1] == params.ubatch.n_tokens;
+        res &= !self_block_table || self_block_table->ne[0] >= mctx->get_block_table_max_mapped_page_plus1();
+    }
 
     return res;
 }
