@@ -1,4 +1,7 @@
-name: Publish muse.cpp server image
+name: Publish CUDA server image
+
+# This is the only active workflow in this fork. Upstream workflows are kept
+# in .github/workflows-upstream so GitHub Actions does not schedule them.
 
 on:
   push:
@@ -18,6 +21,7 @@ jobs:
   server-cuda13:
     name: CUDA 13 server (sm75, sm86, sm89)
     runs-on: ubuntu-24.04
+    timeout-minutes: 180
 
     steps:
       - name: Check out source
