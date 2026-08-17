@@ -23,6 +23,11 @@
 #include <string>
 #include <unordered_set>
 
+void ggml_backend_tensor_copy_slice_async(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, size_t src_offset,
+              ggml_tensor * dst, size_t dst_offset, size_t size);
+
 static constexpr int32_t GGML_TENSOR_FLAG_META_LOCAL_TOP_K_INTERNAL = 64;
 
 // dedup helpers
@@ -128,15 +133,11 @@ static void copy_device_input_async(
     ggml_backend_sched_t     sched) {
     GGML_ASSERT(src_tensor && backend_src && dst_tensor && sched);
 
-    ggml_tensor src = *dst_tensor;
-    src.buffer = src_tensor->buffer;
-    src.data = (char *) src_tensor->data + src_offset;
-    src.view_src  = nullptr;
-    src.view_offs = 0;
-
     ggml_backend_t backend_dst = ggml_backend_sched_get_tensor_backend(sched, dst_tensor);
     GGML_ASSERT(backend_dst != nullptr);
-    ggml_backend_tensor_copy_async(backend_src, backend_dst, &src, dst_tensor);
+    ggml_backend_tensor_copy_slice_async(
+            backend_src, backend_dst, src_tensor, src_offset,
+            dst_tensor, 0, ggml_nbytes(dst_tensor));
 }
 
 void llm_graph_input_embd_h::set_input_device(const llama_ubatch * ubatch, ggml_backend_sched_t sched) {

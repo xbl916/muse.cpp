@@ -572,6 +572,64 @@ size_t ggml_backend_meta_buffer_n_buffers(ggml_backend_buffer_t buffer) {
 ggml_backend_buffer_t ggml_backend_meta_buffer_get_buffer(ggml_backend_buffer_t buffer, size_t index) {
     return ggml_backend_meta_buffer_simple_buffer(buffer, index);
 }
+
+static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index);
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
+bool ggml_backend_meta_tensor_copy_slice_async(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, size_t src_offset,
+              ggml_tensor * dst, size_t dst_offset, size_t size);
+
+bool ggml_backend_meta_tensor_copy_slice_async(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, size_t src_offset,
+              ggml_tensor * dst, size_t dst_offset, size_t size) {
+    if (!ggml_backend_is_meta(backend_src) || !ggml_backend_is_meta(backend_dst) ||
+            !ggml_backend_buffer_is_meta(src->buffer) || !ggml_backend_buffer_is_meta(dst->buffer) ||
+            ggml_blck_size(src->type) != 1 || src->type != dst->type) {
+        return false;
+    }
+
+    const auto src_split = ggml_backend_meta_get_split_state(src, /*assume_sync =*/ false);
+    const auto dst_split = ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
+    if (src_split.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+            dst_split.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        return false;
+    }
+
+    const size_t n = size / ggml_type_size(src->type);
+    if (n * ggml_type_size(src->type) != size ||
+            ggml_backend_meta_n_backends(backend_src) != ggml_backend_meta_n_backends(backend_dst)) {
+        return false;
+    }
+
+    const size_t n_backends = ggml_backend_meta_n_backends(backend_src);
+    for (size_t i = 0; i < n_backends; ++i) {
+        const ggml_tensor * src_simple = ggml_backend_meta_buffer_simple_tensor(src, i);
+              ggml_tensor * dst_simple = ggml_backend_meta_buffer_simple_tensor(dst, i);
+        ggml_tensor src_view = *src_simple;
+        ggml_tensor dst_view = *dst_simple;
+
+        for (ggml_tensor * t : { &src_view, &dst_view }) {
+            t->ne[0] = n;
+            t->ne[1] = t->ne[2] = t->ne[3] = 1;
+            t->nb[0] = ggml_type_size(t->type);
+            t->nb[1] = t->nb[2] = t->nb[3] = size;
+        }
+        src_view.data = (char *) src_simple->data + src_offset;
+        dst_view.data = (char *) dst_simple->data + dst_offset;
+        src_view.view_src = const_cast<ggml_tensor *>(src_simple);
+        dst_view.view_src = dst_simple;
+        src_view.view_offs = src_offset;
+        dst_view.view_offs = dst_offset;
+
+        ggml_backend_tensor_copy_async(
+                ggml_backend_meta_simple_backend(backend_src, i),
+                ggml_backend_meta_simple_backend(backend_dst, i),
+                &src_view, &dst_view);
+    }
+    return true;
+}
 static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor);
 
 static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
@@ -1457,7 +1515,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
     // allocation order - resolving it lazily at compute time can recurse through
     // the whole ancestor chain and overflow the stack.
     if (buf_ctx->stc_static.simple_tensors.find(tensor) != buf_ctx->stc_static.simple_tensors.end()) {
-        return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->stc_static, tensor);
+        return GGML_STATUS_SUCCESS;
     }
     g_meta_alloc_epoch.fetch_add(1, std::memory_order_relaxed);
     ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ true);

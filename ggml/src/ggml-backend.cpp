@@ -22,6 +22,15 @@
 #include <algorithm>
 #include <vector>
 
+bool ggml_backend_meta_tensor_copy_slice_async(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, size_t src_offset,
+              ggml_tensor * dst, size_t dst_offset, size_t size);
+void ggml_backend_tensor_copy_slice_async(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, size_t src_offset,
+              ggml_tensor * dst, size_t dst_offset, size_t size);
+
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -516,6 +525,49 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
     ggml_backend_synchronize(backend_src);
     ggml_backend_synchronize(backend_dst);
     ggml_backend_tensor_copy(src, dst);
+}
+
+void ggml_backend_tensor_copy_slice_async(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, size_t src_offset,
+              ggml_tensor * dst, size_t dst_offset, size_t size) {
+    GGML_ASSERT(src_offset + size <= ggml_nbytes(src));
+    GGML_ASSERT(dst_offset + size <= ggml_nbytes(dst));
+    GGML_ASSERT(src->type == dst->type);
+
+    if (ggml_backend_buffer_is_meta(src->buffer) || ggml_backend_buffer_is_meta(dst->buffer)) {
+        if (ggml_backend_meta_tensor_copy_slice_async(
+                    backend_src, backend_dst, src, src_offset, dst, dst_offset, size)) {
+            return;
+        }
+
+        ggml_backend_synchronize(backend_src);
+        ggml_backend_synchronize(backend_dst);
+        std::vector<uint8_t> data(size);
+        ggml_backend_tensor_get(src, data.data(), src_offset, size);
+        ggml_backend_tensor_set(dst, data.data(), dst_offset, size);
+        return;
+    }
+
+    GGML_ASSERT(ggml_blck_size(src->type) == 1);
+    ggml_tensor src_view = *src;
+    ggml_tensor dst_view = *dst;
+    const size_t n = size / ggml_type_size(src->type);
+    GGML_ASSERT(n * ggml_type_size(src->type) == size);
+
+    for (ggml_tensor * t : { &src_view, &dst_view }) {
+        t->ne[0] = n;
+        t->ne[1] = t->ne[2] = t->ne[3] = 1;
+        t->nb[0] = ggml_type_size(t->type);
+        t->nb[1] = t->nb[2] = t->nb[3] = size;
+    }
+    src_view.data = (char *) src->data + src_offset;
+    dst_view.data = (char *) dst->data + dst_offset;
+    src_view.view_src = const_cast<ggml_tensor *>(src);
+    dst_view.view_src = dst;
+    src_view.view_offs = src_offset;
+    dst_view.view_offs = dst_offset;
+    ggml_backend_tensor_copy_async(backend_src, backend_dst, &src_view, &dst_view);
 }
 
 // events

@@ -20,6 +20,11 @@
 #include <stdexcept>
 #include <string>
 
+void ggml_backend_tensor_copy_slice_async(
+        ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, size_t src_offset,
+              ggml_tensor * dst, size_t dst_offset, size_t size);
+
 //
 // llama_context
 //
@@ -1339,36 +1344,21 @@ bool llama_context::mtp_stage_hidden(
         }
 
         if (seq_id < (int32_t) mtp_pending_hidden_valid.size() && mtp_pending_hidden_valid[seq_id]) {
-            ggml_tensor src_pending = *mtp_pending_hidden_tensor;
-            src_pending.ne[1] = 1;
-            src_pending.nb[2] = src_pending.nb[1];
-            src_pending.nb[3] = src_pending.nb[2];
-            src_pending.data = (char *) src_pending.data + (size_t) seq_id * row_bytes;
-
-            ggml_tensor dst_pending = src_pending;
-            dst_pending.buffer = mtp_hidden_stage_tensor->buffer;
-            dst_pending.data = (char *) mtp_hidden_stage_tensor->data + (size_t) beg * row_bytes;
-            dst_pending.view_src  = nullptr;
-            dst_pending.view_offs = 0;
-            ggml_backend_tensor_copy_async(backend_dst, backend_dst, &src_pending, &dst_pending);
+            ggml_backend_tensor_copy_slice_async(
+                    backend_dst, backend_dst,
+                    mtp_pending_hidden_tensor, (size_t) seq_id * row_bytes,
+                    mtp_hidden_stage_tensor, (size_t) beg * row_bytes, row_bytes);
         } else {
             ggml_backend_tensor_set(mtp_hidden_stage_tensor, pending_h[seq_id], (size_t) beg * row_bytes, row_bytes);
         }
 
         const int32_t n_copy = end - beg;
         if (n_copy > 0) {
-            ggml_tensor src = *ctx_tgt.embd_nextn_device_tensor;
-            src.ne[1] = n_copy;
-            src.nb[2] = src.nb[1] * n_copy;
-            src.nb[3] = src.nb[2] * src.ne[2];
-            src.data = (char *) src.data + (size_t) beg * row_bytes;
-
-            ggml_tensor dst = src;
-            dst.buffer = mtp_hidden_stage_tensor->buffer;
-            dst.data = (char *) mtp_hidden_stage_tensor->data + (size_t) (beg + 1) * row_bytes;
-            dst.view_src  = nullptr;
-            dst.view_offs = 0;
-            ggml_backend_tensor_copy_async(backend_src, backend_dst, &src, &dst);
+            ggml_backend_tensor_copy_slice_async(
+                    backend_src, backend_dst,
+                    ctx_tgt.embd_nextn_device_tensor, (size_t) beg * row_bytes,
+                    mtp_hidden_stage_tensor, (size_t) (beg + 1) * row_bytes,
+                    (size_t) n_copy * row_bytes);
         }
     }
 
@@ -1410,18 +1400,10 @@ bool llama_context::mtp_store_pending_hidden(
             return false;
         }
 
-        ggml_tensor src = *ctx_tgt.embd_nextn_device_tensor;
-        src.ne[1] = 1;
-        src.nb[2] = src.nb[1];
-        src.nb[3] = src.nb[2];
-        src.data = (char *) src.data + (size_t) source_row * row_bytes;
-
-        ggml_tensor dst = src;
-        dst.buffer = mtp_pending_hidden_tensor->buffer;
-        dst.data = (char *) mtp_pending_hidden_tensor->data + (size_t) seq_id * row_bytes;
-        dst.view_src  = nullptr;
-        dst.view_offs = 0;
-        ggml_backend_tensor_copy_async(backend_src, backend_dst, &src, &dst);
+        ggml_backend_tensor_copy_slice_async(
+                backend_src, backend_dst,
+                ctx_tgt.embd_nextn_device_tensor, (size_t) source_row * row_bytes,
+                mtp_pending_hidden_tensor, (size_t) seq_id * row_bytes, row_bytes);
         mtp_pending_hidden_valid[seq_id] = 1;
     }
     return true;
@@ -1453,18 +1435,10 @@ bool llama_context::mtp_prepare_pending_hidden(
             return false;
         }
 
-        ggml_tensor src = *mtp_pending_hidden_tensor;
-        src.ne[1] = 1;
-        src.nb[2] = src.nb[1];
-        src.nb[3] = src.nb[2];
-        src.data = (char *) src.data + (size_t) seq_id * row_bytes;
-
-        ggml_tensor dst = src;
-        dst.buffer = mtp_hidden_stage_tensor->buffer;
-        dst.data = (char *) mtp_hidden_stage_tensor->data + (size_t) dst_row * row_bytes;
-        dst.view_src  = nullptr;
-        dst.view_offs = 0;
-        ggml_backend_tensor_copy_async(backend, backend, &src, &dst);
+        ggml_backend_tensor_copy_slice_async(
+                backend, backend,
+                mtp_pending_hidden_tensor, (size_t) seq_id * row_bytes,
+                mtp_hidden_stage_tensor, (size_t) dst_row * row_bytes, row_bytes);
         rows_used = std::max(rows_used, dst_row + 1);
     }
 
@@ -1562,39 +1536,22 @@ bool llama_context::mtp_stage_draft_step(
             return false;
         }
 
-        ggml_tensor src_token = *t_selected;
-        src_token.ne[0] = 1;
-        src_token.ne[1] = 1;
-        src_token.ne[2] = 1;
-        src_token.ne[3] = 1;
-
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_active, t_h);
         ggml_backend_t backend_token = ggml_backend_sched_get_tensor_backend(sched_active, t_selected);
         if (!backend_h || !backend_token) {
             return false;
         }
 
-        ggml_tensor src_h = *t_h;
-        src_h.ne[1] = 1;
-        src_h.nb[2] = src_h.nb[1];
-        src_h.nb[3] = src_h.nb[2] * src_h.ne[2];
-        src_h.data = (char *) src_h.data + row * src_h.nb[1];
-
-        ggml_tensor dst_h = src_h;
-        dst_h.buffer = mtp_hidden_stage_tensor->buffer;
-        dst_h.data = (char *) mtp_hidden_stage_tensor->data + (size_t) i * src_h.nb[1];
-        dst_h.view_src  = nullptr;
-        dst_h.view_offs = 0;
-        ggml_backend_tensor_copy_async(backend_h, backend_dst, &src_h, &dst_h);
-
-        ggml_tensor dst_token = src_token;
-        dst_token.buffer = mtp_token_stage_tensor->buffer;
-        dst_token.data = (char *) mtp_token_stage_tensor->data + (size_t) i * sizeof(llama_token);
-        dst_token.view_src  = nullptr;
-        dst_token.view_offs = 0;
-        ggml_backend_tensor_copy_async(backend_token, backend_dst, &src_token, &dst_token);
+        ggml_backend_tensor_copy_slice_async(
+                backend_h, backend_dst,
+                t_h, row * t_h->nb[1],
+                mtp_hidden_stage_tensor, (size_t) i * t_h->nb[1], t_h->nb[1]);
+        ggml_backend_tensor_copy_slice_async(
+                backend_token, backend_dst,
+                t_selected, 0,
+                mtp_token_stage_tensor, (size_t) i * sizeof(llama_token), sizeof(llama_token));
         ggml_backend_tensor_get_async(
-                backend_token, &src_token, mtp_token_host + i, 0, sizeof(llama_token));
+                backend_token, t_selected, mtp_token_host + i, 0, sizeof(llama_token));
     }
 
     mtp_hidden_stage_rows   = n_rows;
@@ -2502,12 +2459,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     auto * backend_dst = backend_for_device(model.dev_output());
                     GGML_ASSERT(backend_dst != nullptr);
 
-                    ggml_tensor dst = *t_h_nextn;
-                    dst.buffer = embd_nextn_device_tensor->buffer;
-                    dst.data = (char *) embd_nextn_device_tensor->data + (size_t) offset * n_embd * sizeof(float);
-                    dst.view_src  = nullptr;
-                    dst.view_offs = 0;
-                    ggml_backend_tensor_copy_async(backend_h, backend_dst, t_h_nextn, &dst);
+                    ggml_backend_tensor_copy_slice_async(
+                            backend_h, backend_dst,
+                            t_h_nextn, 0,
+                            embd_nextn_device_tensor, (size_t) offset * n_embd * sizeof(float),
+                            n_rows * n_embd * sizeof(float));
                     embd_nextn_device_rows = std::max<int32_t>(embd_nextn_device_rows, offset + n_rows);
                 } else {
                     float * embd_nextn_out = embd_nextn.data + offset*n_embd;
