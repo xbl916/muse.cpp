@@ -3205,7 +3205,10 @@ private:
         }
 
         const double target_ms = params_base.paged_prefill_target_ms;
-        const int32_t chunk_min = std::min(params_base.paged_prefill_chunk, 32);
+        // Allow one token per slot so a floor of 32 cannot block decode for
+        // hundreds of milliseconds, while preserving prompt-slot fairness.
+        const int32_t chunk_min = std::min(
+                params_base.paged_prefill_chunk, std::max(1, params_base.n_parallel));
         int32_t new_chunk = old_chunk;
         if (paged_prefill_ewma_ms > target_ms * 1.25 && old_chunk > chunk_min) {
             new_chunk = std::max(chunk_min, old_chunk / 2);
@@ -4254,7 +4257,7 @@ private:
 
             for (auto & sample : pending_samples) {
                 try {
-                    common_sampler_prepare(sample.slot->smpl.get(), sample.slot->ctx_tgt, sample.tok_idx);
+                    common_sampler_prepare_nosync(sample.slot->smpl.get(), sample.slot->ctx_tgt, sample.tok_idx);
                 } catch (...) {
                     sample.error = std::current_exception();
                 }

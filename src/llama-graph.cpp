@@ -96,7 +96,9 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
     if (ubatch->token) {
-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        if (!ubatch->token_device) {
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        }
     } else {
         // note: mtmd embedding input goes through here
         GGML_ASSERT(ubatch->embd);
@@ -111,7 +113,42 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     if (ubatch->embd) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
-        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        const size_t size = n_tokens*n_embd*ggml_element_size(h);
+        if (!ubatch->embd_device) {
+            ggml_backend_tensor_set(h, ubatch->embd, 0, size);
+        }
+    }
+}
+
+static void copy_device_input_async(
+        const ggml_tensor * src_tensor,
+                    size_t   src_offset,
+            ggml_backend_t   backend_src,
+             ggml_tensor *   dst_tensor,
+    ggml_backend_sched_t     sched) {
+    GGML_ASSERT(src_tensor && backend_src && dst_tensor && sched);
+
+    ggml_tensor src = *dst_tensor;
+    src.buffer = src_tensor->buffer;
+    src.data = (char *) src_tensor->data + src_offset;
+    src.view_src  = nullptr;
+    src.view_offs = 0;
+
+    ggml_backend_t backend_dst = ggml_backend_sched_get_tensor_backend(sched, dst_tensor);
+    GGML_ASSERT(backend_dst != nullptr);
+    ggml_backend_tensor_copy_async(backend_src, backend_dst, &src, dst_tensor);
+}
+
+void llm_graph_input_embd_h::set_input_device(const llama_ubatch * ubatch, ggml_backend_sched_t sched) {
+    if (ubatch->token_device) {
+        copy_device_input_async(
+                ubatch->token_device, ubatch->token_device_offset,
+                ubatch->token_device_backend, tokens, sched);
+    }
+    if (ubatch->embd_device) {
+        copy_device_input_async(
+                ubatch->embd_device, ubatch->embd_device_offset,
+                ubatch->embd_device_backend, h, sched);
     }
 }
 
@@ -1359,9 +1396,12 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
-void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+void llm_graph_result::set_inputs(const llama_ubatch * ubatch, ggml_backend_sched_t sched) {
     for (auto & input : inputs) {
         input->set_input(ubatch);
+    }
+    for (auto & input : inputs) {
+        input->set_input_device(ubatch, sched);
     }
 }
 

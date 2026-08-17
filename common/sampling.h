@@ -70,6 +70,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 // Prepare candidates from an already synchronized context. This function may be called for several samplers before sampling them in parallel.
 void common_sampler_prepare(struct common_sampler * gsmpl, struct llama_context * ctx, int idx);
 
+// Prepare after the caller has synchronized ctx.
+void common_sampler_prepare_nosync(struct common_sampler * gsmpl, struct llama_context * ctx, int idx);
+
 // Sample candidates prepared by common_sampler_prepare().
 llama_token common_sampler_sample_prepared(struct common_sampler * gsmpl, bool grammar_first = false);
 

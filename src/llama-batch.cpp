@@ -753,7 +753,11 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
 
-    const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
+    int32_t embd_expected = idxs.front();
+    const bool embd_contiguous = batch.embd && std::all_of(
+            idxs.begin(), idxs.end(),
+            [&embd_expected](int32_t idx) { return idx == embd_expected++; });
+    const int64_t n_embd_all = batch.embd && !embd_contiguous ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
 
     udata->token     .resize(n_tokens);
@@ -774,7 +778,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->token[i] = batch.token[idxs[i]];
         }
 
-        if (batch.embd) {
+        if (batch.embd && !embd_contiguous) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
         }
 
@@ -824,7 +828,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ batch.token ? udata->token.data() : nullptr,
-        /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
+        /*.embd         =*/ batch.embd ? (embd_contiguous ? batch.embd + (int64_t) idxs.front()*n_embd : udata->embd.data()) : nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),

@@ -292,11 +292,13 @@ static void test_split(testing & t) {
             bb.add(i, {0}, i == 4);
         }
 
+        llama_batch input = bb.make();
         llama_batch_allocr ba(1);
-        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+        t.assert_true(ba.init(input, vocab, nullptr, bb.n_embd, 4, false));
 
         llama_ubatch ub = ba.split_simple(2);
         t.assert_equal(2u, ub.n_tokens);
+        t.assert_true("contiguous embeddings stay zero-copy", ub.embd == input.embd);
         t.assert_true(!ub.equal_seqs());
         t.assert_equal(1u, ub.n_seqs_unq);
         t.assert_equal(0, ub.seq_id_unq[0]);
@@ -311,6 +313,7 @@ static void test_split(testing & t) {
 
         ub = ba.split_simple(2);
         t.assert_equal(2u, ub.n_tokens);
+        t.assert_true("later contiguous chunk keeps its source offset", ub.embd == input.embd + 2*bb.n_embd);
         t.assert_equal(2, ub.pos[0]);
         t.assert_equal(3, ub.pos[1]);
 

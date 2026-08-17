@@ -1122,7 +1122,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 return updated;
             }
 
-            res->set_inputs(nullptr);
+            res->set_inputs(nullptr, sched);
 
             if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);

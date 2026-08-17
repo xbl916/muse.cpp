@@ -11,6 +11,9 @@
 #include <memory>
 #include <unordered_map>
 
+struct ggml_backend;
+typedef struct ggml_backend * ggml_backend_t;
+
 // keep this struct lightweight
 struct llama_ubatch {
     bool equal_seqs() const {
@@ -66,6 +69,17 @@ struct llama_ubatch {
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    // Optional device-resident hidden-state input for DECODER_MTP. The regular
+    // embedding pointer remains populated so graph construction is unchanged.
+    const ggml_tensor * embd_device = nullptr;
+    size_t embd_device_offset = 0;
+    ggml_backend_t embd_device_backend = nullptr;
+
+    // Optional device-resident token input for a chained MTP draft step.
+    const ggml_tensor * token_device = nullptr;
+    size_t token_device_offset = 0;
+    ggml_backend_t token_device_backend = nullptr;
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch

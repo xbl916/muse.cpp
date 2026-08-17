@@ -90,22 +90,83 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// Host buffer type associated with the context output device. Useful for
+// staging large inputs that are copied to the same device repeatedly.
+LLAMA_API ggml_backend_buffer_type_t llama_get_host_buffer_type(const struct llama_context * ctx);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+
+// Keep unmasked target nextn embeddings on the output device. Intended for
+// MTP target contexts; normal host getters remain available through lazy copies.
+LLAMA_API void llama_set_embeddings_nextn_device(struct llama_context * ctx, bool value);
+
+// Stage shifted target hidden states as the next DECODER_MTP input. Returns
+// false when device staging is unavailable so callers can use the host path.
+LLAMA_API bool llama_mtp_stage_hidden(
+        struct llama_context * ctx_dft,
+        struct llama_context * ctx_tgt,
+        int32_t n_tokens,
+        const int32_t * i_batch_beg,
+        const int32_t * i_batch_end,
+        const float * const * pending_h,
+        int32_t n_seq);
+
+LLAMA_API bool llama_mtp_store_pending_hidden(
+        struct llama_context * ctx_dft,
+        struct llama_context * ctx_tgt,
+        int32_t n_rows,
+        const llama_seq_id * seq_ids,
+        const int32_t * source_rows);
+
+LLAMA_API bool llama_mtp_prepare_pending_hidden(
+        struct llama_context * ctx_dft,
+        int32_t n_rows,
+        const llama_seq_id * seq_ids,
+        const int32_t * destination_rows);
+
+// Queue the sampled token and matching nextn hidden row as device inputs for
+// the next MTP draft decode.
+LLAMA_API bool llama_mtp_stage_draft_step(
+        struct llama_context * ctx_dft,
+        int32_t n_rows,
+        const int32_t * output_indices);
+
+// Copy tokens staged by llama_mtp_stage_draft_step after the caller has
+// synchronized the draft context.
+LLAMA_API bool llama_mtp_get_staged_tokens_nosync(
+        struct llama_context * ctx_dft,
+        int32_t n_rows,
+        llama_token * sampled_tokens);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// Run the DECODER_MTP graph in chained mode: the batch's first row carries the
+// real (token, h) inputs and each following row's inputs come from the previous
+// row's in-graph argmax and hidden state. One decode drafts n_tokens tokens.
+LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, bool value);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
+// The caller must have synchronized ctx before using the returned buffer.
+LLAMA_API float * llama_get_embeddings_nextn_nosync(struct llama_context * ctx);
+
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+// The caller must have synchronized ctx before using the returned row.
+LLAMA_API float * llama_get_embeddings_nextn_ith_nosync(struct llama_context * ctx, int32_t i);
+
+// Copy contiguous unmasked nextn rows after the caller has synchronized ctx.
+LLAMA_API bool llama_copy_embeddings_nextn_rows_nosync(
+        struct llama_context * ctx, int32_t i, int32_t n, float * dst);
 
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
@@ -113,6 +174,16 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+
+// Output accessors for callers that have already synchronized the context.
+LLAMA_API float * llama_get_logits_ith_nosync(struct llama_context * ctx, int32_t i);
+LLAMA_API llama_token llama_get_sampled_token_ith_nosync(struct llama_context * ctx, int32_t i);
+LLAMA_API float * llama_get_sampled_probs_ith_nosync(struct llama_context * ctx, int32_t i);
+LLAMA_API float * llama_get_sampled_logits_ith_nosync(struct llama_context * ctx, int32_t i);
+LLAMA_API llama_token * llama_get_sampled_candidates_ith_nosync(struct llama_context * ctx, int32_t i);
+LLAMA_API uint32_t llama_get_sampled_candidates_count_ith_nosync(struct llama_context * ctx, int32_t i);
+LLAMA_API uint32_t llama_get_sampled_logits_count_ith_nosync(struct llama_context * ctx, int32_t i);
+LLAMA_API uint32_t llama_get_sampled_probs_count_ith_nosync(struct llama_context * ctx, int32_t i);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 

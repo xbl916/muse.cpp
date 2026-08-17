@@ -4,6 +4,7 @@
 #include "fit.h"
 #include "log.h"
 #include "reasoning-budget.h"
+#include "../src/llama-ext.h"
 
 #include "ggml.h"
 
@@ -129,10 +130,10 @@ struct common_sampler {
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
-        const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
-        const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
-        const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+    void set_logits_nosync(struct llama_context * ctx, int idx) {
+        const float *       sampled_probs  = llama_get_sampled_probs_ith_nosync     (ctx, idx);
+        const float *       sampled_logits = llama_get_sampled_logits_ith_nosync    (ctx, idx);
+        const llama_token * sampled_ids    = llama_get_sampled_candidates_ith_nosync(ctx, idx);
 
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -140,19 +141,19 @@ struct common_sampler {
         const int n_vocab = llama_vocab_n_tokens(vocab);
 
         if (sampled_probs) {
-            const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
+            const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith_nosync(ctx, idx);
             cur.resize(sampled_probs_count);
             for (uint32_t i = 0; i < sampled_probs_count; ++i) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
             }
         } else if (sampled_logits) {
-            const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
+            const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith_nosync(ctx, idx);
             cur.resize(sampled_logits_count);
             for (uint32_t i = 0; i < sampled_logits_count; i++) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
         } else {
-            const auto * logits = llama_get_logits_ith(ctx, idx);
+            const auto * logits = llama_get_logits_ith_nosync(ctx, idx);
             GGML_ASSERT(logits != nullptr);
             cur.resize(n_vocab);
             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
@@ -597,16 +598,19 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    llama_synchronize(ctx);
-
     common_sampler_prepare(gsmpl, ctx, idx);
 
     return common_sampler_sample_prepared(gsmpl, grammar_first);
 }
 
 void common_sampler_prepare(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
-    gsmpl->set_logits(ctx, idx);
-    gsmpl->prepared_token = llama_get_sampled_token_ith(ctx, idx);
+    llama_synchronize(ctx);
+    common_sampler_prepare_nosync(gsmpl, ctx, idx);
+}
+
+void common_sampler_prepare_nosync(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    gsmpl->set_logits_nosync(ctx, idx);
+    gsmpl->prepared_token = llama_get_sampled_token_ith_nosync(ctx, idx);
 }
 
 llama_token common_sampler_sample_prepared(struct common_sampler * gsmpl, bool grammar_first) {
@@ -703,9 +707,19 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    // All verification rows come from one target graph. Complete its async
+    // readback once, then consume every row without repeatedly synchronizing
+    // the same scheduler.
+    llama_synchronize(ctx);
+
+    const auto sample_nosync = [&](int32_t idx) {
+        common_sampler_prepare_nosync(gsmpl, ctx, idx);
+        return common_sampler_sample_prepared(gsmpl, grammar_first);
+    };
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = sample_nosync(idxs[i]);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -717,7 +731,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = sample_nosync(idxs[i]);
 
         common_sampler_accept(gsmpl, id, true);
 

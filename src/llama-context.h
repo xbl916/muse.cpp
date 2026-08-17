@@ -87,6 +87,7 @@ struct llama_context {
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+    bool copy_embeddings_nextn_rows(int32_t i, int32_t n, float * dst);
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
@@ -114,10 +115,38 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_embeddings_nextn_device(bool value);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+
+    void set_mtp_chain(bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+
+    bool mtp_stage_hidden(
+            const llama_context & ctx_tgt,
+                      int32_t     n_tokens,
+            const     int32_t   * i_batch_beg,
+            const     int32_t   * i_batch_end,
+            const     float * const * pending_h,
+                      int32_t     n_seq);
+
+    bool mtp_store_pending_hidden(
+            const llama_context & ctx_tgt,
+                      int32_t     n_rows,
+            const llama_seq_id  * seq_ids,
+            const     int32_t   * source_rows);
+
+    bool mtp_prepare_pending_hidden(
+                  int32_t          n_rows,
+        const llama_seq_id        * seq_ids,
+        const     int32_t         * destination_rows);
+
+    bool mtp_stage_draft_step(
+                  int32_t     n_rows,
+        const     int32_t   * output_indices);
+
+    bool mtp_get_staged_tokens(int32_t n_rows, llama_token * sampled_tokens) const;
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -217,6 +246,15 @@ struct llama_context {
             int64_t                          t_loop_start);
 
 private:
+    ggml_backend_t backend_for_device(ggml_backend_dev_t dev) const;
+
+    bool alloc_hidden_device_buffer(
+            ggml_context_ptr & tensor_ctx,
+            ggml_backend_buffer_ptr & buffer,
+            ggml_tensor * & tensor,
+            const char * name,
+            uint32_t n_rows = 0);
+
     //
     // output
     //
@@ -248,8 +286,10 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    // sched_use selects the target scheduler; nullptr means the main one
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        ggml_backend_sched_t sched_use = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -300,6 +340,34 @@ private:
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
 
+    // Fixed device buffers used by MTP. They are independent of output_reserve(),
+    // which may shrink between prompt and decode batches.
+    bool embeddings_nextn_device = false;
+    ggml_context_ptr embd_nextn_device_ctx;
+    ggml_backend_buffer_ptr embd_nextn_device_buf;
+    ggml_tensor * embd_nextn_device_tensor = nullptr;
+    int32_t embd_nextn_device_rows = 0;
+
+    ggml_context_ptr mtp_hidden_stage_ctx;
+    ggml_backend_buffer_ptr mtp_hidden_stage_buf;
+    ggml_tensor * mtp_hidden_stage_tensor = nullptr;
+    int32_t mtp_hidden_stage_rows = 0;
+    bool mtp_hidden_stage_active = false;
+
+    ggml_context_ptr mtp_pending_hidden_ctx;
+    ggml_backend_buffer_ptr mtp_pending_hidden_buf;
+    ggml_tensor * mtp_pending_hidden_tensor = nullptr;
+    std::vector<uint8_t> mtp_pending_hidden_valid;
+
+    ggml_context_ptr mtp_token_stage_ctx;
+    ggml_backend_buffer_ptr mtp_token_stage_buf;
+    ggml_tensor * mtp_token_stage_tensor = nullptr;
+    int32_t mtp_token_stage_rows = 0;
+    bool mtp_token_stage_active = false;
+    ggml_backend_buffer_ptr mtp_token_host_buf;
+    llama_token * mtp_token_host = nullptr;
+    int32_t mtp_token_host_rows = 0;
+
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
@@ -343,6 +411,27 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // per-shape scheduler pool for small decode graphs (LLAMA_SCHED_POOL=N). Each
+    // recurring batch shape keeps its own scheduler and cached graph, so alternating
+    // shapes reuse warm allocations, splits, and backend graph plans instead of
+    // re-splitting through one scheduler.
+    struct sched_slot {
+        uint32_t n_tokens  = 0;
+        uint32_t n_outputs = 0;
+        uint64_t last_used = 0;
+        ggml_backend_sched_ptr sched;
+        std::unique_ptr<llm_graph_result> gf_res;
+        llm_graph_result * alloced = nullptr;
+    };
+    std::vector<sched_slot> sched_pool;
+    uint64_t sched_pool_tick  = 0;
+    int      sched_pool_max   = 0;  // 0 = pool off
+    uint32_t sched_pool_n_max = 32; // shapes up to this many tokens use the pool
+
+    // the scheduler that computed the most recent graph; readback of result tensors
+    // must query this one
+    ggml_backend_sched_t sched_active = nullptr;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
@@ -365,6 +454,8 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+    llm_graph_result *   gf_res_alloced = nullptr; // last result allocated in sched
+    llm_graph_result *   gf_res_active  = nullptr; // graph used by the latest decode
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)
