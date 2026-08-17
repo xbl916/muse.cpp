@@ -1025,20 +1025,23 @@ enum common_params_fit_status common_fit_params(
         float * tensor_split,
         llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins,
-        uint32_t n_ctx_min,
-        ggml_log_level log_level) {
+                           uint32_t n_ctx_min,
+                     ggml_log_level log_level,
+                              bool expand_paged_ctx) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        const bool expand_paged_ctx = cparams->paged_kv && cparams->n_ctx == 0 && n_ctx_min != UINT32_MAX;
-        if (expand_paged_ctx) {
+        const bool auto_paged_ctx = cparams->paged_kv && cparams->n_ctx == 0 && n_ctx_min != UINT32_MAX;
+        if (auto_paged_ctx) {
             cparams->n_ctx = n_ctx_min;
         }
-        if (expand_paged_ctx && mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-            common_expand_paged_tensor_context(path_model, mparams, cparams, margins, n_ctx_min);
+        if (auto_paged_ctx && mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            if (expand_paged_ctx) {
+                common_expand_paged_tensor_context(path_model, mparams, cparams, margins, n_ctx_min);
+            }
         } else {
             common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, log_level);
-            if (expand_paged_ctx) {
+            if (auto_paged_ctx && expand_paged_ctx) {
                 common_expand_paged_context(path_model, mparams, cparams, margins, log_level);
             }
         }

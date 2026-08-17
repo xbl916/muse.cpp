@@ -1217,7 +1217,18 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        common_params params_bootstrap = params_base;
+        const bool paged_auto_pool = params_base.paged_kv && params_base.fit_params && params_base.n_ctx == 0;
+        if (paged_auto_pool) {
+            // Keep the initial pool at one sequence until the draft and multimodal
+            // contexts are resident. The post-load expansion below can then use
+            // actual free memory instead of estimates of their startup peak.
+            params_bootstrap.fit_params_paged_kv_expand = false;
+            SRV_INF("paged KV bootstrap deferred: starting with a %d-token pool until auxiliary contexts are loaded\n",
+                    params_bootstrap.fit_params_min_ctx);
+        }
+
+        llama_init = common_init_from_params(params_bootstrap);
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1311,7 +1322,7 @@ private:
             }
         }
 
-        if (params_base.paged_kv && params_base.fit_params && params.n_ctx == 0) {
+        if (paged_auto_pool) {
             llama_synchronize(ctx_tgt);
             if (ctx_dft != nullptr) {
                 llama_synchronize(ctx_dft);

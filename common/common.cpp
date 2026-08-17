@@ -1299,7 +1299,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+            params.fit_params_paged_kv_expand);
         if (params.paged_kv && fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             COM_ERR("%s", "failed to fit paged model and KV pool to the requested GPU memory target\n");
             return;
@@ -1404,12 +1405,24 @@ bool common_init_result::rebuild_context(common_params & params) {
         return false;
     }
 
+    std::vector<common_sampler_ptr> rebuilt_samplers;
     if (params.sampling.backend_sampling) {
-        cparams.samplers   = pimpl->samplers_seq_config.data();
-        cparams.n_samplers = pimpl->samplers_seq_config.size();
+        rebuilt_samplers.reserve(pimpl->samplers.size());
+        for (const auto & sampler : pimpl->samplers) {
+            rebuilt_samplers.emplace_back(common_sampler_clone(sampler.get()));
+        }
     }
 
     pimpl->context.reset();
+
+    if (params.sampling.backend_sampling) {
+        pimpl->samplers = std::move(rebuilt_samplers);
+        for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
+            pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
+        }
+        cparams.samplers   = pimpl->samplers_seq_config.data();
+        cparams.n_samplers = pimpl->samplers_seq_config.size();
+    }
 
     llama_context * lctx = llama_init_from_model(pimpl->model.get(), cparams);
     if (lctx == nullptr) {
