@@ -1770,6 +1770,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PAGED_PREFILL_CHUNK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--paged-batch-mode"}, "MODE",
+        string_format("batch competing decode and prefill as mixed or homogeneous (default: %s)", params.paged_batch_mode.c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value != "mixed" && value != "homogeneous") {
+                throw std::invalid_argument("paged batch mode must be mixed or homogeneous");
+            }
+            params.paged_batch_mode = value;
+        }
+    ).set_env("LLAMA_ARG_PAGED_BATCH_MODE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--paged-prefill-target-ms"}, "N",
         string_format("target latency for a competing prefill iteration (default: %.0f ms, 0 = fixed prefill chunk)", params.paged_prefill_target_ms),
         [](common_params & params, const std::string & value_str) {
@@ -2883,6 +2893,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
+    add_opt(common_arg(
+        {"--tensor-mirror-output"},
+        {"--no-tensor-mirror-output"},
+        "replicate the output head on every tensor-parallel GPU so backend sampling stays on GPU "
+        "(uses more VRAM; can improve concurrent decode throughput)",
+        [](common_params & params, bool value) {
+            params.tensor_mirror_output = value;
+            common_set_env("LLAMA_META_MIRROR_OUTPUT", value ? "1" : "0");
+        }
+    ).set_env("LLAMA_ARG_TENSOR_MIRROR_OUTPUT"));
     add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1\n"

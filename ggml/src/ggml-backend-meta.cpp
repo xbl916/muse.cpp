@@ -1051,6 +1051,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
         if (tensor->flags & GGML_TENSOR_FLAG_META_GATHER) {
             GGML_ASSERT(tensor->op == GGML_OP_DUP);
+            if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                return src_ss[0];
+            }
             GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0);
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
@@ -2654,6 +2657,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         if (n_rows == 0) {
             return;
         }
+
+        // A mirrored producer already has the complete tensor on the primary
+        // backend. META_GATHER is still present in the sampling graph because
+        // the graph is built from the tensor split mode, so bypass the shard
+        // concatenation in this case.
+        {
+            auto & bc_src = backend_ctx->backend_configs[0];
+            ggml_cgraph * graph_src = bc_src.cgraphs[i].cgraph_main;
+            ggml_tensor * src = graph_src->nodes[graph_src->n_nodes - 1]->src[0];
+            if (src->ne[0] == dst->ne[0] && ggml_nelements(src) == ggml_nelements(dst)) {
+                ggml_backend_tensor_copy_async(bc_src.backend, bc_dst.backend, src, dst);
+                return;
+            }
+        }
+
         int64_t offset_0 = 0;
 
         for (size_t j = 0; j < n_backends; ++j) {

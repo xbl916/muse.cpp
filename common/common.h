@@ -467,6 +467,7 @@ struct common_params {
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
+    bool    tensor_mirror_output = false; // replicate output head for tensor-mode backend sampling
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     bool    fit_params_paged_kv_expand = true; // expand an automatically sized paged KV pool during fitting
@@ -571,6 +572,7 @@ struct common_params {
     float paged_gpu_memory_utilization = 0.90f;
     int32_t kv_block_size  = 32;
     int32_t paged_prefill_chunk = 128;
+    std::string paged_batch_mode = "homogeneous";
     float paged_prefill_target_ms = 50.0f;
     int32_t paged_decode_steps = 3;
 

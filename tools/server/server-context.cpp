@@ -3179,7 +3179,8 @@ private:
     }
 
     void update_paged_prefill_controller(double elapsed_ms) {
-        if (params_base.scheduler != "paged" || params_base.paged_prefill_chunk <= 0 ||
+        if (params_base.scheduler != "paged" || params_base.paged_batch_mode != "homogeneous" ||
+                params_base.paged_prefill_chunk <= 0 ||
                 params_base.paged_prefill_target_ms <= 0.0f) {
             return;
         }
@@ -3322,14 +3323,15 @@ private:
         }
 
         const bool paged_has_competing_prefill = params_base.scheduler == "paged" && has_generating && has_prompt;
-        if (paged_has_competing_prefill && !paged_was_competing) {
+        const bool paged_homogeneous = paged_has_competing_prefill && params_base.paged_batch_mode == "homogeneous";
+        if (paged_homogeneous && !paged_was_competing) {
             // A newly arrived prompt must not delay the next token of an
             // already-running response.
             paged_decode_steps_remaining = 1;
         }
 
-        const bool paged_run_prefill = paged_has_competing_prefill && paged_decode_steps_remaining == 0;
-        if (paged_has_competing_prefill) {
+        const bool paged_run_prefill = paged_homogeneous && paged_decode_steps_remaining == 0;
+        if (paged_homogeneous) {
             if (paged_run_prefill) {
                 paged_decode_steps_remaining = params_base.paged_decode_steps;
             } else {
@@ -3338,7 +3340,7 @@ private:
         } else {
             paged_decode_steps_remaining = 0;
         }
-        paged_was_competing = paged_has_competing_prefill;
+        paged_was_competing = paged_homogeneous;
         paged_batch_prefill_competing = paged_run_prefill;
 
         // track if given slot can be batched with slots already in the batch
@@ -3490,15 +3492,33 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
-        int32_t prompt_batch_limit = n_batch;
-        if (paged_has_competing_prefill && params_base.paged_prefill_chunk > 0) {
-            prompt_batch_limit = paged_run_prefill ? std::min(n_batch, get_paged_prefill_chunk()) : batch.size();
-        }
-
         int32_t n_prompt_slots = 0;
         for (const auto & slot : slots) {
             n_prompt_slots += slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED;
         }
+
+        int32_t prompt_batch_limit = n_batch;
+        if (paged_has_competing_prefill && params_base.paged_prefill_chunk > 0) {
+            if (paged_homogeneous) {
+                if (paged_run_prefill) {
+                    // Do not split a small global adaptive quantum into
+                    // sub-block fragments. Besides making little progress,
+                    // those shapes miss the paged KV/FA fast path.
+                    const int32_t block_floor = std::min(
+                            n_batch, std::max(1, n_prompt_slots) * params_base.kv_block_size);
+                    prompt_batch_limit = std::min(
+                            n_batch, std::max(get_paged_prefill_chunk(), block_floor));
+                } else {
+                    prompt_batch_limit = batch.size();
+                }
+            } else {
+                // v11 policy: keep active decoders and a fixed prompt quantum in
+                // the same batch. This preserves the established graph and
+                // sampling order for long-running tool agents.
+                prompt_batch_limit = std::min(n_batch, batch.size() + params_base.paged_prefill_chunk);
+            }
+        }
+
         const int32_t prompt_slot_limit = n_prompt_slots > 0 ?
             std::max(1, (prompt_batch_limit - batch.size() + n_prompt_slots - 1) / n_prompt_slots) : 0;
 
