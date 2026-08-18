@@ -1195,11 +1195,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_ARGSORT:
             case GGML_OP_TOP_K: {
                 if (tensor->flags & GGML_TENSOR_FLAG_META_LOCAL_TOP_K_INTERNAL) {
-                    GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0);
-                    GGML_ASSERT(tensor->ne[0] % n_bufs == 0);
-                    split_state = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
-                    for (size_t j = 0; j < n_bufs; ++j) {
-                        split_state.ne[j] = tensor->ne[0] / n_bufs;
+                    if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                        split_state = src_ss[0];
+                    } else {
+                        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0);
+                        GGML_ASSERT(tensor->ne[0] % n_bufs == 0);
+                        split_state = {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
+                        for (size_t j = 0; j < n_bufs; ++j) {
+                            split_state.ne[j] = tensor->ne[0] / n_bufs;
+                        }
                     }
                     fixed_split_state = true;
                 } else {
