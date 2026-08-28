@@ -50,6 +50,7 @@ struct clip_context_params {
     bool use_gpu;
     bool tensor_parallel;
     ggml_backend_dev_t * devices;
+    ggml_backend_dev_t device;
     enum clip_flash_attn_type flash_attn_type;
     int image_min_tokens;
     int image_max_tokens;
