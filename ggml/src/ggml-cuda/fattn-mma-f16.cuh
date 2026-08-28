@@ -405,8 +405,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                                 dequantize_V_q4_0<half, 4>(row, tmp + 0, element_offset + 2*k*h2_per_chunk + 0);
                                 dequantize_V_q4_0<half, 4>(row, tmp + 4, element_offset + 2*k*h2_per_chunk + 4);
                             } else if constexpr (type_KV == GGML_TYPE_Q4_1) {
-                                dequantize_V_q4_1<half, 4>(row, tmp + 0, element_offset + 2*k*h2_per_chunk + 0);
-                                dequantize_V_q4_1<half, 4>(row, tmp + 4, element_offset + 2*k*h2_per_chunk + 4);
+                                dequantize_V_q4_1<half, 8>(row, tmp, element_offset + 2*k*h2_per_chunk);
                             } else if constexpr (type_KV == GGML_TYPE_Q5_0) {
                                 dequantize_V_q5_0<half, 4>(row, tmp + 0, element_offset + 2*k*h2_per_chunk + 0);
                                 dequantize_V_q5_0<half, 4>(row, tmp + 4, element_offset + 2*k*h2_per_chunk + 4);
@@ -414,8 +413,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                                 dequantize_V_q5_1<half, 4>(row, tmp + 0, element_offset + 2*k*h2_per_chunk + 0);
                                 dequantize_V_q5_1<half, 4>(row, tmp + 4, element_offset + 2*k*h2_per_chunk + 4);
                             } else {
-                                dequantize_V_q8_0<half, 4>(row, tmp + 0, element_offset + 2*k*h2_per_chunk + 0);
-                                dequantize_V_q8_0<half, 4>(row, tmp + 4, element_offset + 2*k*h2_per_chunk + 4);
+                                dequantize_V_q8_0<half, 8>(row, tmp, element_offset + 2*k*h2_per_chunk);
                             }
                         }
                         ggml_cuda_memcpy_1<16>(tile_KV + i*stride_tile + k*4, tmp);

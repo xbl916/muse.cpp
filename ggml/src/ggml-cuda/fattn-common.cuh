@@ -71,13 +71,16 @@ static __device__ __forceinline__ int fattn_paged_physical_cell(
         const int page_start,
         const int page_end,
         const int block_size) {
-    const int page = logical_cell / block_size;
+    // Paged KV uses 32-cell blocks; keep the generic path for external graphs.
+    const bool block_size_32 = block_size == 32;
+    const int page = block_size_32 ? logical_cell >> 5 : logical_cell / block_size;
     if (page < page_start || page >= page_end) {
         return -1;
     }
 
     const int block = seq_blocks[page];
-    return block >= 0 ? block*block_size + logical_cell - page*block_size : -1;
+    const int cell = block_size_32 ? logical_cell & 31 : logical_cell - page*block_size;
+    return block >= 0 ? block*block_size + cell : -1;
 }
 
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
@@ -482,13 +485,22 @@ static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict
     const int     iqs   =  i0          % (QK4_1/2);
     const int     shift = (i0 % QK4_1) / (QK4_1/2);
 
-    int q;
-    static_assert(ne == 2 || ne == 4, "bad ne");
-    ggml_cuda_memcpy_1<ne>(&q, x[ib].qs + iqs);
-    q >>= 4*shift;
-    q &= 0x0F0F0F0F;
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+    int q[(ne + 3)/4] = {};
+    if constexpr (ne == 8) {
+        ggml_cuda_memcpy_1<4>(q + 0, x[ib].qs + iqs + 0);
+        ggml_cuda_memcpy_1<4>(q + 1, x[ib].qs + iqs + 4);
+    } else {
+        ggml_cuda_memcpy_1<ne>(q, x[ib].qs + iqs);
+    }
 
-    const int8_t * q8 = (const int8_t *) &q;
+#pragma unroll
+    for (int l = 0; l < (ne + 3)/4; ++l) {
+        q[l] >>= 4*shift;
+        q[l] &= 0x0F0F0F0F;
+    }
+
+    const int8_t * q8 = (const int8_t *) q;
 
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
