@@ -16,6 +16,8 @@
 
 struct llama_model;
 class llama_batch_allocr;
+struct llama_mtp_hidden_bridge;
+struct llama_device_tensor_ref;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -253,7 +255,32 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    bool mtp_link_hidden_state(llama_context * ctx_dft);
+    void mtp_set_hidden_input_mode(enum llama_mtp_hidden_input_mode mode);
+    bool mtp_set_pending_hidden(llama_seq_id seq_id, const float * hidden);
+    bool mtp_hidden_state_ready() const;
+    bool mtp_commit_hidden(llama_seq_id seq_id, llama_pos pos);
+
 private:
+    friend bool llama_mtp_stage_init(
+            llama_context * sink,
+            const std::vector<llama_device_tensor_ref> & source_shards);
+    friend bool llama_mtp_stage_capture(
+            llama_context * sink,
+            ggml_backend_sched_t source_sched,
+            ggml_tensor * source_tensor,
+            uint32_t row_offset,
+            const llama_ubatch & ubatch);
+    friend bool llama_mtp_stage_capture_draft(
+            llama_context * ctx,
+            ggml_backend_sched_t source_sched,
+            ggml_tensor * source_tensor,
+            const llama_ubatch & ubatch);
+    friend bool llama_mtp_set_graph_hidden(
+            llama_context * ctx,
+            ggml_tensor * input_h,
+            const llama_ubatch & ubatch);
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -366,6 +393,9 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    llama_context * mtp_hidden_sink = nullptr;
+    std::unique_ptr<llama_mtp_hidden_bridge> mtp_hidden_bridge;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

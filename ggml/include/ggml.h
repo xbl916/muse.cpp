@@ -1389,6 +1389,13 @@ extern "C" {
             struct ggml_tensor  * a,
             float                 eps);
 
+    // RMS normalization with an explicit output type. Accumulation remains F32.
+    GGML_API struct ggml_tensor * ggml_rms_norm_cast(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 eps,
+            enum ggml_type        type);
+
     // group normalize along ne0*ne1*n_groups
     // used in stable-diffusion
     GGML_API struct ggml_tensor * ggml_group_norm(

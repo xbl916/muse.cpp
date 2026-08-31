@@ -107,6 +107,37 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// Link an MTP context to its target so prompt hidden rows can be staged between
+// matching device shards without a device-host-device round trip.
+LLAMA_API bool llama_mtp_link_hidden_state(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
+
+enum llama_mtp_hidden_input_mode {
+    LLAMA_MTP_HIDDEN_INPUT_HOST,
+    LLAMA_MTP_HIDDEN_INPUT_TARGET_SHIFTED,
+    LLAMA_MTP_HIDDEN_INPUT_PENDING,
+    LLAMA_MTP_HIDDEN_INPUT_DRAFT,
+};
+
+LLAMA_API void llama_mtp_set_hidden_input_mode(
+        struct llama_context * ctx_dft,
+        enum llama_mtp_hidden_input_mode mode);
+
+LLAMA_API bool llama_mtp_set_pending_hidden(
+        struct llama_context * ctx_dft,
+        llama_seq_id seq_id,
+        const float * hidden);
+
+// Returns true after the target hidden staging layout has been initialized and
+// every row from the most recent target decode is available on the devices.
+LLAMA_API bool llama_mtp_hidden_state_ready(struct llama_context * ctx_dft);
+
+// Move a staged target row into the per-sequence carry slot without going
+// through host memory.
+LLAMA_API bool llama_mtp_commit_hidden(
+        struct llama_context * ctx_dft,
+        llama_seq_id seq_id,
+        llama_pos pos);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

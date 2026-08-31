@@ -1383,10 +1383,28 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
-void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+void llm_graph_result::set_inputs(const llama_ubatch * ubatch, bool skip_hidden) {
     for (auto & input : inputs) {
+        if (skip_hidden) {
+            if (auto * inp_h = dynamic_cast<llm_graph_input_embd_h *>(input.get())) {
+                const int64_t n_tokens = ubatch->n_tokens;
+                GGML_ASSERT(ubatch->token && inp_h->tokens);
+                ggml_backend_tensor_set(inp_h->tokens, ubatch->token, 0,
+                        n_tokens * ggml_element_size(inp_h->tokens));
+                continue;
+            }
+        }
         input->set_input(ubatch);
     }
+}
+
+ggml_tensor * llm_graph_result::get_inp_h() const {
+    for (const auto & input : inputs) {
+        if (const auto * inp_h = dynamic_cast<const llm_graph_input_embd_h *>(input.get())) {
+            return inp_h->h;
+        }
+    }
+    return nullptr;
 }
 
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
@@ -1618,10 +1636,15 @@ ggml_tensor * llm_graph_context::build_norm(
          ggml_tensor * mw,
          ggml_tensor * mb,
        llm_norm_type   type,
-                 int   il) const {
+                 int   il,
+           ggml_type   output_type) const {
     switch (type) {
         case LLM_NORM:       cur = ggml_norm    (ctx0, cur, hparams.f_norm_eps);     break;
-        case LLM_NORM_RMS:   cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps); break;
+        case LLM_NORM_RMS:
+            cur = output_type == GGML_TYPE_COUNT ?
+                ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps) :
+                ggml_rms_norm_cast(ctx0, cur, hparams.f_norm_rms_eps, output_type);
+            break;
         case LLM_NORM_GROUP:
             {
                 cur = ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, cur->ne[1]);
@@ -1629,6 +1652,8 @@ ggml_tensor * llm_graph_context::build_norm(
                 cur = ggml_reshape_2d(ctx0, cur, cur->ne[0],    cur->ne[2]);
             } break;
     }
+
+    GGML_ASSERT(output_type == GGML_TYPE_COUNT || type == LLM_NORM_RMS);
 
     if (mw || mb) {
         cb(cur, "norm", il);

@@ -3181,6 +3181,23 @@ struct ggml_tensor * ggml_rms_norm_inplace(
     return ggml_rms_norm_impl(ctx, a, eps, true);
 }
 
+struct ggml_tensor * ggml_rms_norm_cast(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        float                 eps,
+        enum ggml_type        type) {
+    GGML_ASSERT(type == GGML_TYPE_F32 || type == GGML_TYPE_BF16);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, type, GGML_MAX_DIMS, a->ne);
+
+    ggml_set_op_params(result, &eps, sizeof(eps));
+
+    result->op     = GGML_OP_RMS_NORM;
+    result->src[0] = a;
+
+    return result;
+}
+
 // ggml_rms_norm_back
 
 struct ggml_tensor * ggml_rms_norm_back(

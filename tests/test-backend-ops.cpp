@@ -3516,6 +3516,95 @@ struct test_rms_norm : public test_case {
     }
 };
 
+// GGML_OP_RMS_NORM with an explicit output type
+struct test_rms_norm_cast : public test_case {
+    const ggml_type type_src;
+    const ggml_type type_dst;
+    const std::array<int64_t, 4> ne;
+    const float eps;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_src, type_dst, ne, eps);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_rms_norm_cast(
+            ggml_type type_src,
+            ggml_type type_dst,
+            std::array<int64_t, 4> ne = {64, 5, 4, 3},
+            float eps = 1e-6f)
+        : type_src(type_src), type_dst(type_dst), ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type_src, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_rms_norm_cast(ctx, a, eps, type_dst);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
+// GGML_OP_RMS_NORM + GGML_OP_MUL with mixed BF16 input/output
+struct test_rms_norm_cast_mul : public test_case {
+    const ggml_type type_src;
+    const ggml_type type_dst;
+    const std::array<int64_t, 4> ne;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_CAST_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_src, type_dst, ne, eps);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_rms_norm_cast_mul(
+            ggml_type type_src,
+            ggml_type type_dst,
+            std::array<int64_t, 4> ne = {64, 5, 4, 3},
+            float eps = 1e-6f)
+        : type_src(type_src), type_dst(type_dst), ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type_src, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_param(a);
+        ggml_set_param(w);
+        ggml_set_name(a, "a");
+        ggml_set_name(w, "w");
+
+        ggml_tensor * norm = ggml_rms_norm_cast(ctx, a, eps, type_dst);
+        ggml_tensor * out = ggml_mul(ctx, norm, w);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+    }
+};
+
 // GGML_OP_RMS_NORM_BACK
 struct test_rms_norm_back : public test_case {
     const ggml_type type;
@@ -9096,6 +9185,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
+
+    for (uint32_t n : {64, 1025}) {
+        test_cases.emplace_back(new test_rms_norm_cast(GGML_TYPE_F32,  GGML_TYPE_BF16, {n, 5, 4, 3}));
+        test_cases.emplace_back(new test_rms_norm_cast(GGML_TYPE_BF16, GGML_TYPE_BF16, {n, 5, 4, 3}));
+        test_cases.emplace_back(new test_rms_norm_cast(GGML_TYPE_BF16, GGML_TYPE_F32,  {n, 5, 4, 3}));
+        test_cases.emplace_back(new test_rms_norm_cast_mul(GGML_TYPE_F32,  GGML_TYPE_BF16, {n, 5, 4, 3}));
+        test_cases.emplace_back(new test_rms_norm_cast_mul(GGML_TYPE_BF16, GGML_TYPE_BF16, {n, 5, 4, 3}));
+        test_cases.emplace_back(new test_rms_norm_cast_mul(GGML_TYPE_BF16, GGML_TYPE_F32,  {n, 5, 4, 3}));
+    }
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f }) {
         for (uint32_t n : { 64, 1025 }) {

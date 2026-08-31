@@ -1145,7 +1145,7 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
-        const std::vector<size_t> paged_memory_reserve = params_base.fit_params_target;
+        std::vector<size_t> paged_memory_reserve = params_base.fit_params_target;
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1322,6 +1322,16 @@ private:
             }
         }
 
+        if (spec_mtp && model_tgt != nullptr) {
+            const size_t hidden_stage = (size_t(llama_n_batch(ctx_tgt)) + 2 * size_t(llama_n_seq_max(ctx_tgt))) *
+                    size_t(llama_model_n_embd_out(model_tgt)) * sizeof(float);
+            for (size_t & reserve : paged_memory_reserve) {
+                reserve += hidden_stage;
+            }
+            SRV_INF("reserving %.2f MiB per tensor-parallel device for MTP hidden staging before final KV expansion\n",
+                    hidden_stage / 1024.0 / 1024.0);
+        }
+
         if (params_base.paged_kv && params_base.fit_params && params.n_ctx == 0) {
             llama_synchronize(ctx_tgt);
             if (ctx_dft != nullptr) {
@@ -1356,54 +1366,91 @@ private:
                 SRV_INF("post-load paged KV expansion: %u -> %u tokens, governed by --gpu-memory-utilization=%.3f\n",
                         current_pool, expanded_pool, params_base.paged_gpu_memory_utilization);
 
-                spec_init.reset();
-                ctx_dft   = nullptr;
-                model_dft = nullptr;
-                params_base.speculative.draft.ctx_tgt = nullptr;
-                params_base.speculative.draft.ctx_dft = nullptr;
-
                 common_params params_rebuild = params_base;
                 params_rebuild.fit_params = false;
-                params_rebuild.n_ctx = expanded_pool;
 
-                if (!llama_init->rebuild_context(params_rebuild)) {
-                    SRV_WRN("post-load KV expansion failed; restoring the initial %u-token pool\n", current_pool);
-                    params_rebuild.n_ctx = current_pool;
-                    if (!llama_init->rebuild_context(params_rebuild)) {
-                        SRV_ERR("failed to restore the initial %u-token context\n", current_pool);
-                        return false;
-                    }
-                }
-
-                ctx_tgt = llama_init->context();
-                n_ctx = llama_n_ctx(ctx_tgt);
-
-                if (!load_spec_context(false)) {
-                    if (llama_n_ctx(ctx_tgt) <= current_pool) {
-                        return false;
-                    }
-
-                    SRV_WRN("MTP/draft reload failed after KV expansion; restoring the initial %u-token pool\n", current_pool);
+                auto clear_spec_context = [&]() {
                     spec_init.reset();
                     ctx_dft   = nullptr;
                     model_dft = nullptr;
                     params_base.speculative.draft.ctx_tgt = nullptr;
                     params_base.speculative.draft.ctx_dft = nullptr;
+                };
 
-                    params_rebuild.n_ctx = current_pool;
+                auto try_pool = [&](uint32_t pool) {
+                    clear_spec_context();
+                    params_rebuild.n_ctx = pool;
                     if (!llama_init->rebuild_context(params_rebuild)) {
-                        SRV_ERR("failed to restore the initial %u-token context\n", current_pool);
                         return false;
                     }
 
                     ctx_tgt = llama_init->context();
                     n_ctx = llama_n_ctx(ctx_tgt);
                     if (!load_spec_context(false)) {
+                        clear_spec_context();
                         return false;
                     }
+
+                    for (size_t i = 0; i < paged_devices.size(); ++i) {
+                        size_t free  = 0;
+                        size_t total = 0;
+                        ggml_backend_dev_memory(paged_devices[i], &free, &total);
+                        GGML_UNUSED(total);
+
+                        const size_t reserve = i < paged_memory_reserve.size() ? paged_memory_reserve[i] : 0;
+                        if (free < reserve) {
+                            SRV_DBG("post-load KV pool %u leaves %.2f MiB free on %s, below the %.2f MiB runtime reserve\n",
+                                    pool, free / 1024.0 / 1024.0, ggml_backend_dev_name(paged_devices[i]),
+                                    reserve / 1024.0 / 1024.0);
+                            clear_spec_context();
+                            return false;
+                        }
+                    }
+
+                    return true;
+                };
+
+                uint32_t selected_pool = 0;
+                if (try_pool(expanded_pool)) {
+                    selected_pool = llama_n_ctx(ctx_tgt);
+                } else {
+                    const uint32_t alignment = std::max<uint32_t>(256, params_base.kv_block_size);
+                    uint32_t low  = current_pool;
+                    uint32_t high = expanded_pool - alignment;
+                    uint32_t best = current_pool;
+
+                    SRV_WRN("maximum post-load KV pool did not fit; searching [%u, %u] without dropping back directly to the bootstrap size\n",
+                            low, high);
+
+                    while (low <= high) {
+                        uint32_t candidate = low + (high - low) / 2;
+                        candidate -= candidate % alignment;
+                        candidate = std::max(candidate, current_pool);
+
+                        if (try_pool(candidate)) {
+                            best = std::max(best, llama_n_ctx(ctx_tgt));
+                            if (candidate > UINT32_MAX - alignment) {
+                                break;
+                            }
+                            low = candidate + alignment;
+                        } else {
+                            if (candidate <= current_pool) {
+                                break;
+                            }
+                            high = candidate - alignment;
+                        }
+                    }
+
+                    // The last probe may have failed or may not be the best successful
+                    // one, so build the selected size once more as the final context.
+                    if (!try_pool(best)) {
+                        SRV_ERR("failed to restore the selected %u-token context after KV expansion probes\n", best);
+                        return false;
+                    }
+                    selected_pool = llama_n_ctx(ctx_tgt);
                 }
 
-                SRV_INF("post-load paged KV pool ready: %u tokens\n", n_ctx);
+                SRV_INF("post-load paged KV pool ready: %u tokens\n", selected_pool);
             } else {
                 if (current_pool >= max_pool) {
                     SRV_INF("post-load paged KV pool remains %u tokens; configured request capacity is already reached\n", current_pool);

@@ -1427,9 +1427,22 @@ bool common_init_result::rebuild_context(common_params & params) {
         return false;
     }
 
+    std::vector<common_sampler_ptr> samplers;
+    std::vector<llama_sampler_seq_config> samplers_seq_config;
+
     if (params.sampling.backend_sampling) {
-        cparams.samplers   = pimpl->samplers_seq_config.data();
-        cparams.n_samplers = pimpl->samplers_seq_config.size();
+        // Backend sampler initialization is tied to the context's sampling graph.
+        // A rebuilt context therefore needs fresh sampler instances, while their
+        // mutable sampling state is preserved by cloning.
+        samplers.resize(pimpl->samplers.size());
+        samplers_seq_config.resize(pimpl->samplers.size());
+        for (size_t i = 0; i < pimpl->samplers.size(); ++i) {
+            samplers[i].reset(common_sampler_clone(pimpl->samplers[i].get()));
+            samplers_seq_config[i] = { (llama_seq_id) i, common_sampler_get(samplers[i].get()) };
+        }
+
+        cparams.samplers   = samplers_seq_config.data();
+        cparams.n_samplers = samplers_seq_config.size();
     }
 
     pimpl->context.reset();
@@ -1441,6 +1454,11 @@ bool common_init_result::rebuild_context(common_params & params) {
     }
 
     pimpl->context.reset(lctx);
+
+    if (params.sampling.backend_sampling) {
+        pimpl->samplers            = std::move(samplers);
+        pimpl->samplers_seq_config = std::move(samplers_seq_config);
+    }
 
     if (!params.control_vectors.empty()) {
         const int32_t layer_start = params.control_vector_layer_start > 0 ? params.control_vector_layer_start : 1;
@@ -1834,6 +1852,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
     cparams.paged_kv          = params.paged_kv;
+    cparams.bf16_prefill      = params.bf16_prefill;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

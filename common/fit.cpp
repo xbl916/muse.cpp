@@ -263,85 +263,19 @@ static void common_expand_paged_tensor_context(
         llama_context_params * cparams,
         size_t * margins,
         uint32_t n_ctx_min) {
-    const std::vector<ggml_backend_dev_t> devices = common_tensor_devices(mparams);
-    if (devices.empty()) {
-        throw common_params_fit_exception("tensor parallelism has no devices");
-    }
+    GGML_UNUSED(path_model);
+    GGML_UNUSED(mparams);
+    GGML_UNUSED(margins);
 
-    llama_model_params mparams_probe = *mparams;
-    mparams_probe.no_alloc = false;
-    mparams_probe.progress_callback = nullptr;
-    mparams_probe.progress_callback_user_data = nullptr;
+    // At this point only the target model is accounted for. Expanding into the
+    // apparent free space can leave no room for MTP, the multimodal projector,
+    // or their warm-up graphs. The server performs a second measurement after
+    // all auxiliary contexts are resident, so keep the bootstrap pool at the
+    // requested minimum and let that post-load pass use the real free memory.
+    cparams->n_ctx = n_ctx_min;
 
-    LOG_INF("%s: measuring tensor-parallel KV shards with a %u token pool\n", __func__, n_ctx_min);
-
-    std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
-            llama_model_load_from_file(path_model, mparams_probe), llama_model_free);
-    if (!model) {
-        throw std::runtime_error("failed to load tensor-parallel model for paged KV measurement");
-    }
-
-    llama_context_params cparams_probe = *cparams;
-    cparams_probe.n_ctx = n_ctx_min;
-    std::unique_ptr<llama_context, decltype(&llama_free)> ctx(
-            llama_init_from_model(model.get(), cparams_probe), llama_free);
-    if (!ctx) {
-        throw common_params_fit_exception("minimum tensor-parallel paged KV pool does not fit");
-    }
-
-    std::vector<size_t> kv_bytes(devices.size(), 0);
-    const llama_memory_breakdown breakdown = llama_get_memory_breakdown(ctx.get());
-    for (const auto & [buft, mb] : breakdown) {
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        for (size_t i = 0; i < devices.size(); ++i) {
-            if (dev == devices[i]) {
-                kv_bytes[i] += mb.context;
-                break;
-            }
-        }
-    }
-
-    int64_t extra_tokens = INT64_MAX;
-    bool has_kv_shard = false;
-    for (size_t i = 0; i < devices.size(); ++i) {
-        size_t free = 0;
-        size_t total = 0;
-        ggml_backend_dev_memory(devices[i], &free, &total);
-        GGML_UNUSED(total);
-
-        if (kv_bytes[i] == 0) {
-            LOG_INF("%s: device %s has no local KV shard\n", __func__, ggml_backend_dev_name(devices[i]));
-            continue;
-        }
-
-        has_kv_shard = true;
-        const int64_t available = int64_t(free) - int64_t(margins[i]);
-        const int64_t fit = available > 0 ? available * n_ctx_min / int64_t(kv_bytes[i]) : 0;
-        extra_tokens = std::min(extra_tokens, fit);
-
-        LOG_INF("%s: device %s local KV=%.2f MiB/%u tokens, free=%.2f MiB, room=%" PRId64 " tokens\n",
-                __func__, ggml_backend_dev_name(devices[i]), kv_bytes[i] / 1024.0 / 1024.0, n_ctx_min,
-                free / 1024.0 / 1024.0, fit);
-    }
-
-    if (!has_kv_shard || extra_tokens <= 0) {
-        throw common_params_fit_exception("no device memory available for tensor-parallel paged KV expansion");
-    }
-
-    extra_tokens = extra_tokens * 85 / 100;
-    uint64_t expanded = uint64_t(n_ctx_min) + uint64_t(extra_tokens);
-    if (cparams->n_ctx_seq > 0 && cparams->n_seq_max > 0) {
-        expanded = std::min(expanded, uint64_t(cparams->n_ctx_seq) * cparams->n_seq_max);
-    }
-    expanded = std::min<uint64_t>(expanded, UINT32_MAX);
-
-    const uint32_t alignment = std::max<uint32_t>(256, cparams->kv_block_size);
-    cparams->n_ctx = uint32_t(expanded);
-    cparams->n_ctx -= cparams->n_ctx % alignment;
-    cparams->n_ctx = std::max(cparams->n_ctx, n_ctx_min);
-
-    LOG_INF("%s: tensor-parallel paged KV bootstrap pool=%u tokens, per-sequence max=%u, temporary safety=0.85\n",
-            __func__, cparams->n_ctx, cparams->n_ctx_seq);
+    LOG_INF("%s: tensor-parallel paged KV bootstrap pool=%u tokens; deferring expansion until auxiliary contexts are loaded\n",
+            __func__, cparams->n_ctx);
 }
 
 static void common_params_fit_impl(

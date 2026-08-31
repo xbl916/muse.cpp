@@ -1002,6 +1002,7 @@ struct ggml_backend_cuda_comm_context {
 static bool ggml_backend_cuda_comm_allreduce_nccl(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
     const int64_t ne = ggml_nelements(tensors[0]);
+    const ggml_type type = tensors[0]->type;
     // FIXME the input of llm_graph_context::build_in_out_ids can produce a tensor with 0 elements if n_outputs == 0
     // This then causes a crash in this function
     if (ne == 0) {
@@ -1013,7 +1014,33 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
     for (size_t i = 0; i < n_backends; ++i) {
         GGML_ASSERT(tensors[i] != nullptr);
         GGML_ASSERT(ggml_nelements(tensors[i]) == ne);
+        GGML_ASSERT(tensors[i]->type == type);
         GGML_ASSERT(ggml_is_contiguously_allocated(tensors[i]));
+    }
+
+    // BF16/F16 graph boundaries are already in their final wire format. Reduce
+    // them directly and avoid allocating or converting through an F32 buffer.
+    if (type == GGML_TYPE_BF16 || type == GGML_TYPE_F16) {
+        const ncclDataType_t nccl_type = type == GGML_TYPE_BF16 ? ncclBfloat16 : ncclHalf;
+        for (size_t i = 0; i < n_backends; ++i) {
+            if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+                ggml_cuda_set_device(cuda_ctx->device);
+                CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+            }
+        }
+        NCCL_CHECK(ncclGroupStart());
+        for (size_t i = 0; i < n_backends; ++i) {
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+            NCCL_CHECK(ncclAllReduce(tensors[i]->data, tensors[i]->data, ne, nccl_type, ncclSum,
+                comm_ctx->comms[i], cuda_ctx->stream()));
+        }
+        NCCL_CHECK(ncclGroupEnd());
+        return true;
+    }
+
+    if (type != GGML_TYPE_F32) {
+        return false;
     }
 
     // For small tensors, simply reduce them as FP32.
@@ -1831,7 +1858,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Therefore, in such cases use cuBLAS.
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    if (bad_padding_clear ||
+        (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_BF16) ||
+        dst->type != GGML_TYPE_F32) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
@@ -1839,14 +1868,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+    if (src1->type == GGML_TYPE_F32 && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
     // A transposed vector can still use MMVQ (i.e. ne01 == 1)
-    if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
+    if (src1->type == GGML_TYPE_F32 && ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
             && src0->type == GGML_TYPE_F32
             && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
             && ggml_cuda_should_use_mmvf(src1->type, cc, src1->ne, src1->nb, /*ne11 =*/ 1)) {
@@ -1859,11 +1888,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+    if (src1->type == GGML_TYPE_F32 && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    if (src1->type == GGML_TYPE_F32 && ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -3144,17 +3173,20 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             add = cgraph->nodes[node_idx+2];
         }
 
-        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
-
-        //rms norm only supports F32
-        if (mul->src[0]->type != GGML_TYPE_F32 ||
-            mul->src[1]->type != GGML_TYPE_F32 ||
-            mul->type != GGML_TYPE_F32) {
+        const ggml_tensor * mul_weight = mul->src[0] == rms_norm ? mul->src[1] :
+                                         mul->src[1] == rms_norm ? mul->src[0] : nullptr;
+        const bool supported_types = mul_weight && mul_weight->type == GGML_TYPE_F32 &&
+            (rms_norm->src[0]->type == GGML_TYPE_F32 || rms_norm->src[0]->type == GGML_TYPE_BF16) &&
+            (rms_norm->type == GGML_TYPE_F32 || rms_norm->type == GGML_TYPE_BF16) &&
+            mul->type == rms_norm->type;
+        if (!supported_types) {
             return false;
         }
 
-        if (add && (add->src[0]->type != GGML_TYPE_F32 ||
+        // The fused add variant remains F32-only.
+        if (add && (rms_norm->src[0]->type != GGML_TYPE_F32 ||
+            rms_norm->type != GGML_TYPE_F32 ||
+            add->src[0]->type != GGML_TYPE_F32 ||
             add->src[1]->type != GGML_TYPE_F32 ||
             add->type != GGML_TYPE_F32) ) {
             return false;
@@ -4318,7 +4350,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    cuda_ctx->mmq_q8_cache_begin();
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    cuda_ctx->mmq_q8_cache_end();
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5193,9 +5227,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
             break;
         case GGML_OP_NORM:
-        case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
             return ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_RMS_NORM:
+            return ggml_is_contiguous_rows(op->src[0]) &&
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) &&
+                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_BF16);
         case GGML_OP_RMS_NORM_BACK:
             return ggml_is_contiguous(op->src[0]);
             break;
@@ -5218,9 +5255,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
-                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
-                   (op->type         == GGML_TYPE_F32 || op->type         == GGML_TYPE_F16);
+            return
+                (op->src[0]->type == GGML_TYPE_F32  && op->src[1]->type == GGML_TYPE_F32  && op->type == GGML_TYPE_F32)  ||
+                (op->src[0]->type == GGML_TYPE_F16  && op->src[1]->type == GGML_TYPE_F16  && op->type == GGML_TYPE_F16)  ||
+                (op->src[0]->type == GGML_TYPE_F16  && op->src[1]->type == GGML_TYPE_F32  && op->type == GGML_TYPE_F16)  ||
+                (op->src[0]->type == GGML_TYPE_F16  && op->src[1]->type == GGML_TYPE_F32  && op->type == GGML_TYPE_F32)  ||
+                (op->src[0]->type == GGML_TYPE_BF16 && op->src[1]->type == GGML_TYPE_BF16 && op->type == GGML_TYPE_BF16) ||
+                (op->src[0]->type == GGML_TYPE_BF16 && op->src[1]->type == GGML_TYPE_F32  && op->type == GGML_TYPE_BF16) ||
+                (op->src[0]->type == GGML_TYPE_F32  && op->src[1]->type == GGML_TYPE_BF16 && op->type == GGML_TYPE_F32);
         case GGML_OP_SSM_SCAN: {
             const int32_t K = ggml_get_op_params_i32(op, 0);
 

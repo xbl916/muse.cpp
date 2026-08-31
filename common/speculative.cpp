@@ -1393,6 +1393,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
+    std::vector<llama_pos> verify_pos_first;
+    std::vector<bool> verify_h_device;
+
+    bool device_hidden = false;
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
@@ -1454,6 +1458,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
+        device_hidden = llama_mtp_link_hidden_state(ctx_tgt, ctx_dft);
+        SPC_INF("device hidden staging=%d\n", (int) device_hidden);
+
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
@@ -1475,6 +1482,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        verify_pos_first.assign(n_seq, -1);
+        verify_h_device.assign(n_seq, false);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1548,6 +1557,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        const bool device_ready = device_hidden && llama_mtp_hidden_state_ready(ctx_dft);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
@@ -1562,7 +1572,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            {
+            if (!device_ready) {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
@@ -1577,7 +1587,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                if (!device_ready) {
+                    set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                    llama_mtp_set_pending_hidden(ctx_dft, seq_id, pending_h[seq_id].data());
+                }
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1595,7 +1608,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                llama_mtp_set_hidden_input_mode(ctx_dft, device_ready ?
+                        LLAMA_MTP_HIDDEN_INPUT_TARGET_SHIFTED : LLAMA_MTP_HIDDEN_INPUT_HOST);
                 const int32_t rc = llama_decode(ctx_dft, batch);
+                llama_mtp_set_hidden_input_mode(ctx_dft, LLAMA_MTP_HIDDEN_INPUT_HOST);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1619,15 +1635,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            verify_pos_first[seq_id] = batch_in.pos[i_batch_beg[seq_id]];
+            verify_h_device[seq_id] = device_ready;
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+            if (device_ready) {
+                if (!llama_mtp_commit_hidden(ctx_dft, seq_id, batch_in.pos[i_batch_end[seq_id]])) {
+                    SPC_ERR("failed to preserve staged target hidden row for seq_id=%d pos=%d\n",
+                            (int) seq_id, (int) batch_in.pos[i_batch_end[seq_id]]);
+                    return false;
+                }
+            } else {
+                verify_h[seq_id].resize((size_t) n_rows * n_embd);
+
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                    std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
+                }
+
+                std::memcpy(pending_h[seq_id].data(),
+                        verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
             }
-
-            std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
 
         return true;
@@ -1666,6 +1693,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         int i = 0;
+        const bool pending_on_device = device_hidden && llama_mtp_hidden_state_ready(ctx_dft) &&
+                !chain_heads && !is_mem_shared;
 
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
@@ -1684,7 +1713,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            if (pending_on_device) {
+                llama_mtp_set_hidden_input_mode(ctx_dft, i == 0 ?
+                        LLAMA_MTP_HIDDEN_INPUT_PENDING : LLAMA_MTP_HIDDEN_INPUT_DRAFT);
+            }
             int ret = llama_decode(ctx_dft, batch);
+            llama_mtp_set_hidden_input_mode(ctx_dft, LLAMA_MTP_HIDDEN_INPUT_HOST);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
@@ -1703,7 +1737,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                const float * h_row = pending_on_device ? nullptr :
+                        llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1755,7 +1790,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 } else {
                     common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
-                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                    if (!pending_on_device) {
+                        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                    }
                 }
 
                 i_last[seq_id] = batch.n_tokens - 1;
@@ -1795,6 +1832,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        if (verify_h_device[seq_id]) {
+            const llama_pos pos = verify_pos_first[seq_id] + i_h;
+            if (!llama_mtp_commit_hidden(params.ctx_dft, seq_id, pos)) {
+                SPC_ERR("failed to select staged target hidden row for seq_id=%d pos=%d\n",
+                        (int) seq_id, (int) pos);
+            }
+            return;
+        }
+
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
@@ -2499,6 +2545,8 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
 
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
+    const bool has_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
@@ -2522,6 +2570,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
+
+    if (has_mtp && params_spec.mtp_ubatch > 0) {
+        result.n_ubatch = std::min(result.n_batch, params_spec.mtp_ubatch);
+    }
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types

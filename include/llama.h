@@ -409,6 +409,7 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool paged_kv;    // use block-table-managed KV allocation
+        bool bf16_prefill; // use BF16 norm activations and TP boundaries in supported CUDA prefill graphs [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

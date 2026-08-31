@@ -914,6 +914,7 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_inp_h()       const;
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -924,7 +925,7 @@ public:
 
     void reset();
 
-    void set_inputs(const llama_ubatch * ubatch);
+    void set_inputs(const llama_ubatch * ubatch, bool skip_hidden = false);
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
@@ -1084,7 +1085,8 @@ struct llm_graph_context {
              ggml_tensor * mw,
              ggml_tensor * mb,
            llm_norm_type   type,
-                     int   il) const;
+                     int   il,
+               ggml_type   output_type = GGML_TYPE_COUNT) const;
 
 
     // compute Q, K, V projections with optional bias and reshape

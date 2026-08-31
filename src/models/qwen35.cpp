@@ -146,6 +146,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
+    const bool bf16_tp = cparams.bf16_prefill && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+        tensor_split && tensor_split_devices > 1 && n_tokens >= 32;
+
     inpL = build_inp_embd(model.tok_embd);
 
     cb(inpL, "model.input_embed", -1);
@@ -161,7 +164,8 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
         ggml_tensor * inpSA = inpL;
 
-        cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+        cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il,
+            bf16_tp ? GGML_TYPE_BF16 : GGML_TYPE_COUNT);
         cb(cur, "attn_norm", il);
 
         ggml_build_forward_expand(gf, cur);
@@ -188,7 +192,13 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         ggml_tensor * ffn_residual = cur;
 
         // Post-attention norm
-        ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
+        ggml_tensor * attn_post_norm_inp = cur;
+        if (bf16_tp) {
+            attn_post_norm_inp = ggml_cast(ctx0, attn_post_norm_inp, GGML_TYPE_BF16);
+            cb(attn_post_norm_inp, "attn_post_norm_inp_bf16", il);
+        }
+        ggml_tensor * attn_post_norm = build_norm(attn_post_norm_inp, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il,
+            bf16_tp ? GGML_TYPE_BF16 : GGML_TYPE_COUNT);
         cb(attn_post_norm, "attn_post_norm", il);
 
         // Dense FFN layer - without residual connection
@@ -202,12 +212,18 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        if (bf16_tp) {
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_BF16);
+            cb(cur, "l_out_bf16", il);
+        }
+
         // Input for next layer
         inpL = cur;
     }
     cur = inpL;
 
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1,
+        bf16_tp ? GGML_TYPE_F32 : GGML_TYPE_COUNT);
 
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;

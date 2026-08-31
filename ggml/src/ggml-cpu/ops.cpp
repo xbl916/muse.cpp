@@ -3853,6 +3853,49 @@ static void ggml_compute_forward_rms_norm_f32(
     }
 }
 
+template <typename src_t, typename dst_t>
+static void ggml_compute_forward_rms_norm_cast(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->nb[0] == sizeof(src_t));
+    GGML_ASSERT(dst->nb[0] == sizeof(dst_t));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    for (int64_t i03 = 0; i03 < ne03; ++i03) {
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const src_t * x = (const src_t *) ((const char *) src0->data + i01 * nb01 + i02 * nb02 + i03 * nb03);
+                dst_t * y = (dst_t *) ((char *) dst->data + i01 * nb1 + i02 * nb2 + i03 * nb3);
+
+                ggml_float sum = 0.0;
+                for (int64_t i00 = 0; i00 < ne00; ++i00) {
+                    const float xi = type_conversion_table<src_t>::to_f32(x[i00]);
+                    sum += (ggml_float) xi * xi;
+                }
+
+                const float scale = 1.0f / sqrtf((float) (sum / ne00) + eps);
+                GGML_ASSERT(scale > 0.0f);
+
+                for (int64_t i00 = 0; i00 < ne00; ++i00) {
+                    const float xi = type_conversion_table<src_t>::to_f32(x[i00]);
+                    y[i00] = type_conversion_table<dst_t>::from_f32(xi * scale);
+                }
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_rms_norm(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -3862,7 +3905,23 @@ void ggml_compute_forward_rms_norm(
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_NONE>(params, dst);
+                if (dst->type == GGML_TYPE_F32) {
+                    ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_NONE>(params, dst);
+                } else if (dst->type == GGML_TYPE_BF16) {
+                    ggml_compute_forward_rms_norm_cast<float, ggml_bf16_t>(params, dst);
+                } else {
+                    GGML_ABORT("unsupported RMS norm output type: %s", ggml_type_name(dst->type));
+                }
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                if (dst->type == GGML_TYPE_F32) {
+                    ggml_compute_forward_rms_norm_cast<ggml_bf16_t, float>(params, dst);
+                } else if (dst->type == GGML_TYPE_BF16) {
+                    ggml_compute_forward_rms_norm_cast<ggml_bf16_t, ggml_bf16_t>(params, dst);
+                } else {
+                    GGML_ABORT("unsupported RMS norm output type: %s", ggml_type_name(dst->type));
+                }
             } break;
         default:
             {

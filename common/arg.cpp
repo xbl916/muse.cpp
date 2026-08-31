@@ -1677,6 +1677,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--bf16-prefill"},
+        {"--no-bf16-prefill"},
+        string_format("use BF16 norm activations and TP boundaries in supported CUDA prefill graphs (default: %s)", params.bf16_prefill ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.bf16_prefill = value;
+        }
+    ).set_env("LLAMA_ARG_BF16_PREFILL"));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {
@@ -4072,6 +4080,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     //
     // speculative parameters
     //
+
+    add_opt(common_arg(
+        {"--spec-mtp-ubatch"}, "N",
+        string_format("physical batch size for MTP prompt catch-up (default: %d, 0 = inherit --ubatch-size)", params.speculative.draft.mtp_ubatch),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("MTP ubatch must be non-negative");
+            }
+            params.speculative.draft.mtp_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+      .set_env("LLAMA_ARG_SPEC_MTP_UBATCH"));
 
     add_opt(common_arg(
         {"--spec-draft-hf", "-hfd", "-hfrd", "--hf-repo-draft"}, "<user>/<model>[:quant]",

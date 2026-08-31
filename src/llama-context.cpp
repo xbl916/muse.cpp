@@ -13,16 +13,94 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 //
 // llama_context
 //
+
+struct llama_mtp_hidden_bridge {
+    struct shard {
+        ggml_backend_t backend = nullptr;
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buffer;
+        ggml_tensor * tensor = nullptr;
+    };
+
+    llama_context * source = nullptr;
+    uint32_t capacity = 0;
+    uint32_t n_embd = 0;
+    uint32_t n_rows = 0;
+    bool enabled = false;
+    bool capture_failed = false;
+    llama_mtp_hidden_input_mode input_mode = LLAMA_MTP_HIDDEN_INPUT_HOST;
+    std::vector<shard> shards;
+    std::unordered_map<uint64_t, uint32_t> rows;
+
+    static uint64_t key(llama_seq_id seq_id, llama_pos pos) {
+        return (uint64_t(uint32_t(seq_id)) << 32) | uint32_t(pos);
+    }
+};
+
+struct llama_device_tensor_ref {
+    ggml_backend_t backend;
+    ggml_tensor * tensor;
+};
+
+static std::vector<llama_device_tensor_ref> llama_tensor_shards(
+        ggml_backend_sched_t sched, ggml_tensor * tensor) {
+    std::vector<llama_device_tensor_ref> result;
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+    if (backend == nullptr || tensor == nullptr || tensor->buffer == nullptr) {
+        return result;
+    }
+
+    if (ggml_backend_is_meta(backend) && ggml_backend_buffer_is_meta(tensor->buffer)) {
+        const size_t n = ggml_backend_meta_n_backends(backend);
+        result.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            ggml_tensor * simple = ggml_backend_meta_buffer_get_tensor(tensor, i);
+            if (simple != nullptr && ggml_nelements(simple) > 0) {
+                result.push_back({ggml_backend_meta_simple_backend(backend, i), simple});
+            }
+        }
+    } else {
+        result.push_back({backend, tensor});
+    }
+    return result;
+}
+
+static ggml_tensor llama_tensor_rows(ggml_tensor * tensor, uint32_t row, uint32_t n_rows) {
+    ggml_tensor view = *tensor;
+    GGML_ASSERT(ggml_n_dims(tensor) <= 2 || (tensor->ne[2] == 1 && tensor->ne[3] == 1));
+    GGML_ASSERT(row + n_rows <= (uint32_t) tensor->ne[1]);
+    view.ne[1] = n_rows;
+    view.ne[2] = 1;
+    view.ne[3] = 1;
+    view.nb[2] = view.nb[1] * n_rows;
+    view.nb[3] = view.nb[2];
+    view.data = static_cast<char *>(tensor->data) + row * tensor->nb[1];
+    return view;
+}
+
+static bool llama_tensor_same_layout(const ggml_tensor & a, const ggml_tensor & b) {
+    if (a.type != b.type) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (a.ne[i] != b.ne[i] || a.nb[i] != b.nb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -272,6 +350,7 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
     cparams.paged_kv = params.paged_kv;
+    cparams.bf16_prefill = params.bf16_prefill;
     cparams.kv_block_size = params.kv_block_size;
 
     // initialized later
@@ -321,6 +400,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
+    LLAMA_LOG_INFO("%s: bf16_prefill          = %s\n",   __func__, cparams.bf16_prefill ? "true" : "false");
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
         LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
@@ -1267,6 +1347,282 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     return true;
 }
 
+bool llama_context::mtp_link_hidden_state(llama_context * ctx_dft) {
+    if (ctx_dft == nullptr || ctx_dft->cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        LLAMA_LOG_INFO("%s: MTP hidden staging unavailable: draft context type mismatch\n", __func__);
+        return false;
+    }
+    if (const char * env = getenv("LLAMA_MTP_DEVICE_HIDDEN")) {
+        if (atoi(env) == 0) {
+            LLAMA_LOG_INFO("%s: device-resident MTP hidden staging disabled by environment\n", __func__);
+            return false;
+        }
+    }
+    if (model.hparams.n_embd_out() != ctx_dft->model.hparams.n_embd_out()) {
+        LLAMA_LOG_INFO("%s: MTP hidden staging unavailable: hidden width mismatch (%u != %u)\n", __func__,
+                model.hparams.n_embd_out(), ctx_dft->model.hparams.n_embd_out());
+        return false;
+    }
+
+    auto bridge = std::make_unique<llama_mtp_hidden_bridge>();
+    bridge->source   = this;
+    bridge->capacity = cparams.n_batch;
+    bridge->n_embd   = model.hparams.n_embd_out();
+    bridge->rows.reserve(cparams.n_batch);
+
+    ctx_dft->mtp_hidden_bridge = std::move(bridge);
+    ctx_dft->gf_res_prev->reset();
+    ctx_dft->sched_need_reserve = true;
+    mtp_hidden_sink = ctx_dft;
+    LLAMA_LOG_INFO("%s: enabled device-resident MTP hidden staging for up to %u rows\n",
+            __func__, cparams.n_batch);
+    return true;
+}
+
+void llama_context::mtp_set_hidden_input_mode(llama_mtp_hidden_input_mode mode) {
+    if (mtp_hidden_bridge) {
+        mtp_hidden_bridge->input_mode = mode;
+    }
+}
+
+bool llama_context::mtp_set_pending_hidden(llama_seq_id seq_id, const float * hidden) {
+    if (!mtp_hidden_bridge || hidden == nullptr || seq_id < 0 || (uint32_t) seq_id >= cparams.n_seq_max ||
+            mtp_hidden_bridge->shards.empty()) {
+        return false;
+    }
+
+    const bool mirrored = std::all_of(
+            mtp_hidden_bridge->shards.begin(), mtp_hidden_bridge->shards.end(),
+            [&](const llama_mtp_hidden_bridge::shard & shard) {
+                return shard.tensor->ne[0] == (int64_t) mtp_hidden_bridge->n_embd;
+            });
+
+    size_t feature_offset = 0;
+    const uint32_t row = mtp_hidden_bridge->capacity + seq_id;
+    for (auto & shard : mtp_hidden_bridge->shards) {
+        const size_t n = shard.tensor->ne[0];
+        const size_t src_offset = mirrored ? 0 : feature_offset;
+        if (src_offset + n > mtp_hidden_bridge->n_embd) {
+            return false;
+        }
+        ggml_backend_tensor_set_async(shard.backend, shard.tensor, hidden + src_offset,
+                row * shard.tensor->nb[1], n * sizeof(float));
+        feature_offset += mirrored ? 0 : n;
+    }
+    return mirrored || feature_offset == mtp_hidden_bridge->n_embd;
+}
+
+bool llama_context::mtp_hidden_state_ready() const {
+    return mtp_hidden_bridge && mtp_hidden_bridge->enabled &&
+            !mtp_hidden_bridge->capture_failed && !mtp_hidden_bridge->shards.empty();
+}
+
+bool llama_context::mtp_commit_hidden(llama_seq_id seq_id, llama_pos pos) {
+    if (!mtp_hidden_state_ready() || seq_id < 0 || (uint32_t) seq_id >= cparams.n_seq_max) {
+        return false;
+    }
+
+    auto & bridge = *mtp_hidden_bridge;
+    const auto it = bridge.rows.find(llama_mtp_hidden_bridge::key(seq_id, pos));
+    if (it == bridge.rows.end()) {
+        return false;
+    }
+
+    for (auto & shard : bridge.shards) {
+        ggml_tensor src = llama_tensor_rows(shard.tensor, it->second, 1);
+        ggml_tensor dst = llama_tensor_rows(shard.tensor, bridge.capacity + seq_id, 1);
+        ggml_backend_tensor_copy_async(shard.backend, shard.backend, &src, &dst);
+    }
+    return true;
+}
+
+bool llama_mtp_stage_init(
+        llama_context * sink,
+        const std::vector<llama_device_tensor_ref> & source_shards) {
+    auto & bridge = *sink->mtp_hidden_bridge;
+    if (!bridge.shards.empty()) {
+        return bridge.shards.size() == source_shards.size();
+    }
+
+    const uint32_t n_rows = bridge.capacity + 2 * sink->cparams.n_seq_max;
+    bridge.shards.reserve(source_shards.size());
+
+    for (const auto & source : source_shards) {
+        llama_mtp_hidden_bridge::shard stage;
+        stage.backend = source.backend;
+
+        const ggml_init_params params = {
+            /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        stage.ctx.reset(ggml_init(params));
+        stage.tensor = ggml_new_tensor_2d(stage.ctx.get(), GGML_TYPE_F32, source.tensor->ne[0], n_rows);
+        stage.tensor->nb[1] = source.tensor->nb[1];
+        stage.tensor->nb[2] = stage.tensor->nb[1] * n_rows;
+        stage.tensor->nb[3] = stage.tensor->nb[2];
+        ggml_set_name(stage.tensor, "mtp_hidden_stage");
+
+        stage.buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(
+                stage.ctx.get(), ggml_backend_buffer_get_type(source.tensor->buffer)));
+        if (!stage.buffer) {
+            bridge.shards.clear();
+            return false;
+        }
+        ggml_backend_buffer_clear(stage.buffer.get(), 0);
+        bridge.shards.emplace_back(std::move(stage));
+    }
+
+    LLAMA_LOG_INFO("%s: allocated device MTP hidden staging across %zu shard(s), capacity=%u rows\n",
+            __func__, bridge.shards.size(), n_rows);
+    return !bridge.shards.empty();
+}
+
+bool llama_mtp_stage_capture(
+        llama_context * sink,
+        ggml_backend_sched_t source_sched,
+        ggml_tensor * source_tensor,
+        uint32_t row_offset,
+        const llama_ubatch & ubatch) {
+    auto & bridge = *sink->mtp_hidden_bridge;
+    if (row_offset + ubatch.n_tokens > bridge.capacity) {
+        return false;
+    }
+
+    const auto source_shards = llama_tensor_shards(source_sched, source_tensor);
+    if (!llama_mtp_stage_init(sink, source_shards) || source_shards.size() != bridge.shards.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < source_shards.size(); ++i) {
+        auto & source = source_shards[i];
+        auto & stage  = bridge.shards[i];
+        if (source.tensor->ne[0] != stage.tensor->ne[0] ||
+                ggml_backend_get_device(source.backend) != ggml_backend_get_device(stage.backend)) {
+            return false;
+        }
+
+        ggml_tensor src = llama_tensor_rows(source.tensor, 0, ubatch.n_tokens);
+        ggml_tensor dst = llama_tensor_rows(stage.tensor, row_offset, ubatch.n_tokens);
+        if (!llama_tensor_same_layout(src, dst)) {
+            return false;
+        }
+        ggml_backend_tensor_copy_async(source.backend, stage.backend, &src, &dst);
+    }
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        GGML_ASSERT(ubatch.n_seq_id[i] == 1);
+        bridge.rows[llama_mtp_hidden_bridge::key(ubatch.seq_id[i][0], ubatch.pos[i])] = row_offset + i;
+    }
+    bridge.n_rows = std::max(bridge.n_rows, row_offset + ubatch.n_tokens);
+    bridge.enabled = true;
+    return true;
+}
+
+bool llama_mtp_stage_capture_draft(
+        llama_context * ctx,
+        ggml_backend_sched_t source_sched,
+        ggml_tensor * source_tensor,
+        const llama_ubatch & ubatch) {
+    auto & bridge = *ctx->mtp_hidden_bridge;
+    const auto source_shards = llama_tensor_shards(source_sched, source_tensor);
+    if (!llama_mtp_stage_init(ctx, source_shards) || source_shards.size() != bridge.shards.size()) {
+        return false;
+    }
+
+    uint32_t source_row = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!ubatch.output[i]) {
+            continue;
+        }
+
+        if (ubatch.n_seq_id[i] != 1) {
+            return false;
+        }
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        if (seq_id < 0 || (uint32_t) seq_id >= ctx->cparams.n_seq_max) {
+            return false;
+        }
+
+        const uint32_t destination_row = bridge.capacity + ctx->cparams.n_seq_max + seq_id;
+        for (size_t shard_index = 0; shard_index < source_shards.size(); ++shard_index) {
+            const auto & source = source_shards[shard_index];
+            auto & destination = bridge.shards[shard_index];
+            if (source.tensor->ne[0] != destination.tensor->ne[0] ||
+                    ggml_backend_get_device(source.backend) != ggml_backend_get_device(destination.backend)) {
+                return false;
+            }
+
+            ggml_tensor src = llama_tensor_rows(source.tensor, source_row, 1);
+            ggml_tensor dst = llama_tensor_rows(destination.tensor, destination_row, 1);
+            if (!llama_tensor_same_layout(src, dst)) {
+                return false;
+            }
+            ggml_backend_tensor_copy_async(source.backend, destination.backend, &src, &dst);
+        }
+        ++source_row;
+    }
+
+    return source_row > 0;
+}
+
+bool llama_mtp_set_graph_hidden(
+        llama_context * ctx,
+        ggml_tensor * input_h,
+        const llama_ubatch & ubatch) {
+    auto & bridge = *ctx->mtp_hidden_bridge;
+    const auto destination_shards = llama_tensor_shards(ctx->sched.get(), input_h);
+    if (destination_shards.size() != bridge.shards.size()) {
+        return false;
+    }
+
+    std::vector<uint32_t> source_rows(ubatch.n_tokens);
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        if (seq_id < 0 || (uint32_t) seq_id >= ctx->cparams.n_seq_max) {
+            return false;
+        }
+
+        if (bridge.input_mode == LLAMA_MTP_HIDDEN_INPUT_PENDING) {
+            source_rows[i] = bridge.capacity + seq_id;
+            continue;
+        }
+        if (bridge.input_mode == LLAMA_MTP_HIDDEN_INPUT_DRAFT) {
+            source_rows[i] = bridge.capacity + ctx->cparams.n_seq_max + seq_id;
+            continue;
+        }
+
+        const auto it = bridge.rows.find(llama_mtp_hidden_bridge::key(seq_id, ubatch.pos[i] - 1));
+        source_rows[i] = it != bridge.rows.end() ? it->second : bridge.capacity + seq_id;
+    }
+
+    for (size_t i = 0; i < bridge.shards.size(); ++i) {
+        auto & source = bridge.shards[i];
+        auto destination = destination_shards[i];
+        if (source.tensor->ne[0] != destination.tensor->ne[0] ||
+                ggml_backend_get_device(source.backend) != ggml_backend_get_device(destination.backend)) {
+            return false;
+        }
+
+        for (uint32_t dst_row = 0; dst_row < ubatch.n_tokens;) {
+            uint32_t n_rows = 1;
+            while (dst_row + n_rows < ubatch.n_tokens &&
+                    source_rows[dst_row + n_rows] == source_rows[dst_row] + n_rows) {
+                ++n_rows;
+            }
+
+            ggml_tensor src = llama_tensor_rows(source.tensor, source_rows[dst_row], n_rows);
+            ggml_tensor dst = llama_tensor_rows(destination.tensor, dst_row, n_rows);
+            if (!llama_tensor_same_layout(src, dst)) {
+                return false;
+            }
+            ggml_backend_tensor_copy_async(source.backend, destination.backend, &src, &dst);
+            dst_row += n_rows;
+        }
+    }
+    return true;
+}
+
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
@@ -1341,7 +1697,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1372,6 +1728,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mtp_hidden_bridge) {
+            if (ggml_tensor * input_h = res->get_inp_h()) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), input_h, backends.front().get());
+            }
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1384,7 +1746,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
+        const bool device_hidden = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mtp_hidden_bridge &&
+                mtp_hidden_bridge->input_mode != LLAMA_MTP_HIDDEN_INPUT_HOST && res->get_inp_h() != nullptr;
+        res->set_inputs(&ubatch, device_hidden);
+        if (device_hidden && !llama_mtp_set_graph_hidden(this, res->get_inp_h(), ubatch)) {
+            LLAMA_LOG_ERROR("%s: failed to bind staged MTP hidden rows to the draft graph\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -1799,6 +2168,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    const bool mtp_device_hidden = mtp_hidden_sink && mtp_hidden_sink->mtp_hidden_bridge &&
+            mtp_hidden_sink->mtp_hidden_bridge->enabled;
+    if (mtp_hidden_sink && mtp_hidden_sink->mtp_hidden_bridge) {
+        auto & bridge = *mtp_hidden_sink->mtp_hidden_bridge;
+        bridge.rows.clear();
+        bridge.n_rows = 0;
+        bridge.capture_failed = false;
+    }
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -1861,6 +2239,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
+
+        if (mtp_hidden_sink && t_h_nextn && !cparams.embeddings_nextn_masked) {
+            if (!llama_mtp_stage_capture(mtp_hidden_sink, sched.get(), t_h_nextn, n_tokens_prev, ubatch)) {
+                mtp_hidden_sink->mtp_hidden_bridge->capture_failed = true;
+                if (mtp_device_hidden) {
+                    LLAMA_LOG_ERROR("%s: device MTP hidden staging changed after activation\n", __func__);
+                    return -2;
+                }
+                LLAMA_LOG_DEBUG("%s: device MTP hidden staging unavailable for this graph; using host transfer\n", __func__);
+            }
+        }
+
+        const bool mtp_draft_hidden = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mtp_hidden_bridge &&
+                mtp_hidden_bridge->enabled && mtp_hidden_bridge->input_mode != LLAMA_MTP_HIDDEN_INPUT_HOST;
+        if (mtp_draft_hidden && t_h_nextn && cparams.embeddings_nextn_masked && n_outputs > 0) {
+            if (!llama_mtp_stage_capture_draft(this, sched.get(), t_h_nextn, ubatch)) {
+                LLAMA_LOG_ERROR("%s: failed to preserve MTP draft hidden rows on the device\n", __func__);
+                return -2;
+            }
+        }
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -1950,7 +2348,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            if (!mtp_device_hidden && !mtp_draft_hidden && embd_nextn.data && t_h_nextn && n_rows > 0 &&
+                    cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -3638,6 +4037,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.paged_kv                    =*/ false,
+        /*.bf16_prefill                =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -3873,6 +4273,28 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+bool llama_mtp_link_hidden_state(llama_context * ctx_tgt, llama_context * ctx_dft) {
+    return ctx_tgt != nullptr && ctx_tgt->mtp_link_hidden_state(ctx_dft);
+}
+
+void llama_mtp_set_hidden_input_mode(llama_context * ctx_dft, llama_mtp_hidden_input_mode mode) {
+    if (ctx_dft != nullptr) {
+        ctx_dft->mtp_set_hidden_input_mode(mode);
+    }
+}
+
+bool llama_mtp_set_pending_hidden(llama_context * ctx_dft, llama_seq_id seq_id, const float * hidden) {
+    return ctx_dft != nullptr && ctx_dft->mtp_set_pending_hidden(seq_id, hidden);
+}
+
+bool llama_mtp_hidden_state_ready(llama_context * ctx_dft) {
+    return ctx_dft != nullptr && ctx_dft->mtp_hidden_state_ready();
+}
+
+bool llama_mtp_commit_hidden(llama_context * ctx_dft, llama_seq_id seq_id, llama_pos pos) {
+    return ctx_dft != nullptr && ctx_dft->mtp_commit_hidden(seq_id, pos);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

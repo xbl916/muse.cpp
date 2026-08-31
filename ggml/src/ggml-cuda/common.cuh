@@ -1424,6 +1424,19 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    struct mmq_q8_cache_entry {
+        const ggml_tensor * src1;
+        ggml_type           type_src0;
+        bool                fallback;
+        int                 stream_no;
+        ggml_cuda_pool *    pool;
+        void *              data;
+        size_t              size;
+    };
+
+    bool mmq_q8_cache_active = false;
+    std::vector<mmq_q8_cache_entry> mmq_q8_cache;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
@@ -1529,6 +1542,20 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_pool & pool() {
         return pool(device);
+    }
+
+    void mmq_q8_cache_begin() {
+        GGML_ASSERT(!mmq_q8_cache_active);
+        GGML_ASSERT(mmq_q8_cache.empty());
+        mmq_q8_cache_active = true;
+    }
+
+    void mmq_q8_cache_end() {
+        for (auto it = mmq_q8_cache.rbegin(); it != mmq_q8_cache.rend(); ++it) {
+            it->pool->free(it->data, it->size);
+        }
+        mmq_q8_cache.clear();
+        mmq_q8_cache_active = false;
     }
 };
 
@@ -1673,4 +1700,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

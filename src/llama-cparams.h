@@ -54,6 +54,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool paged_kv;
+    bool bf16_prefill;
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

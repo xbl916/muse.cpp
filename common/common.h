@@ -331,6 +331,10 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // Physical batch size used only by an in-model MTP context. Zero inherits
+    // the target context setting so large catch-up buffers are never implicit.
+    int32_t mtp_ubatch = 0;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
@@ -590,6 +594,7 @@ struct common_params {
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
+    bool bf16_prefill      = false; // use BF16 norm activations and TP boundaries in supported CUDA prefill graphs
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
