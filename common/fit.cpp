@@ -4,6 +4,7 @@
 
 #include "../src/llama-ext.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <stdexcept>
@@ -35,7 +36,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        uint32_t * hp_ngl_paged = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -143,6 +145,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
+    if (hp_ngl_paged) {
+        *hp_ngl_paged = llama_model_n_gpu_layers_for_paged(model);
+    }
 
     common_memory_breakdown_print(ctx);
 
@@ -291,6 +296,7 @@ static void common_params_fit_impl(
 
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
+    uint32_t hp_ngl_paged = 0; // minimum n_gpu_layers that keeps all attention layers on GPU
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
 
@@ -363,7 +369,8 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full = common_get_device_memory_data_impl(
+        path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &hp_ngl_paged);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -561,7 +568,14 @@ static void common_params_fit_impl(
         throw common_params_fit_exception("was unable to fit model into system memory by reducing context, abort");
     }
 
-    if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
+    const bool paged_layer_all = cparams->paged_kv && nd > 1 && mparams->split_mode == LLAMA_SPLIT_MODE_LAYER &&
+        (mparams->n_gpu_layers < 0 || uint32_t(mparams->n_gpu_layers) >= hp_ngl_paged);
+    const int32_t initial_n_gpu_layers = mparams->n_gpu_layers;
+    std::vector<float> initial_tensor_split(nd, 0.0f);
+    if (mparams->tensor_split) {
+        std::copy(mparams->tensor_split, mparams->tensor_split + nd, initial_tensor_split.begin());
+    }
+    if (mparams->n_gpu_layers != default_mparams.n_gpu_layers && !paged_layer_all) {
         throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
     }
     if (nd > 1) {
@@ -569,10 +583,18 @@ static void common_params_fit_impl(
             throw common_params_fit_exception("did not provide a buffer to write the tensor_split to, abort");
         }
         if (mparams->tensor_split) {
+            bool has_user_tensor_split = false;
             for (size_t id = 0; id < nd; id++) {
                 if (mparams->tensor_split[id] != 0.0f) {
-                    throw common_params_fit_exception("model_params::tensor_split already set by user, abort");
+                    has_user_tensor_split = true;
+                    break;
                 }
+            }
+            if (has_user_tensor_split && !paged_layer_all) {
+                throw common_params_fit_exception("model_params::tensor_split already set by user, abort");
+            }
+            if (has_user_tensor_split) {
+                LOG_INF("%s: paged layer mode will rebalance the user-provided tensor split to meet device memory targets\n", __func__);
             }
         }
         if (mparams->split_mode == LLAMA_SPLIT_MODE_ROW) {
@@ -694,8 +716,16 @@ static void common_params_fit_impl(
         llama_model_params mparams_copy = *mparams;
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
+        llama_context_params cparams_copy = *cparams;
+        if (paged_layer_all && uint32_t(mparams_copy.n_gpu_layers) < hp_ngl_paged) {
+            // Intermediate fit probes may place attention layers on the CPU. Paged KV
+            // rejects those contexts, but the equivalent unified KV layout is sufficient
+            // for estimating memory until the final all-GPU allocation is selected.
+            cparams_copy.paged_kv = false;
+        }
+
         dmds_t dmd_nl = common_get_device_memory_data_impl(
-            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, &mparams_copy, &cparams_copy, devs, hp_ngl, hp_nct, hp_nex, log_level);
         add_extra_memory(dmd_nl);
 
         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
@@ -712,6 +742,119 @@ static void common_params_fit_impl(
             ret.push_back(dmd_nl[id].mb.total());
         }
         return ret;
+    };
+
+    auto min_physical_headroom = [&](const std::vector<int64_t> & memory) {
+        int64_t result = INT64_MAX;
+        for (size_t id = 0; id < nd; ++id) {
+            result = std::min(result, dmds_full[id].free - memory[id]);
+        }
+        return result;
+    };
+
+    auto set_final_layer_allocation = [&] (
+            const std::vector<ngl_t> & ngl_per_device,
+            const std::vector<ggml_backend_buffer_type_t> & overflow_bufts) {
+        uint32_t n_gpu_layers = 0;
+        for (const ngl_t & ngl : ngl_per_device) {
+            n_gpu_layers += ngl.n_layer;
+        }
+        if (!paged_layer_all || n_gpu_layers >= hp_ngl_paged) {
+            set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+            return;
+        }
+
+        if (hp_nex > 0) {
+            constexpr int64_t hard_margin = 256*MiB;
+            bool initial_allocation_fits = true;
+            for (size_t id = 0; id < nd; ++id) {
+                const int64_t projected_free = dmds_full[id].free - dmds_full[id].mb.total();
+                initial_allocation_fits = initial_allocation_fits && projected_free >= hard_margin;
+            }
+            if (!initial_allocation_fits) {
+                throw common_params_fit_exception(
+                    "paged layer mode could not keep all attention layers on GPU within physical device memory");
+            }
+            mparams->n_gpu_layers = initial_n_gpu_layers;
+            std::copy(initial_tensor_split.begin(), initial_tensor_split.end(), tensor_split);
+            mparams->tensor_split = tensor_split;
+            tensor_buft_overrides[0] = {nullptr, nullptr};
+            mparams->tensor_buft_overrides = tensor_buft_overrides;
+            return;
+        }
+
+        LOG_WRN("%s: layer granularity cannot meet every requested memory reserve; searching for an all-attention GPU split that fits physical memory\n",
+            __func__);
+
+        std::vector<ngl_t> physical_ngl = ngl_per_device;
+        std::vector<int64_t> physical_mem = get_memory_for_layers(__func__, physical_ngl, overflow_bufts);
+        while (n_gpu_layers < hp_ngl_paged) {
+            size_t best_id = nd;
+            int64_t best_headroom = INT64_MIN;
+            std::vector<int64_t> best_mem;
+            for (size_t id = 0; id < nd; ++id) {
+                std::vector<ngl_t> test_ngl = physical_ngl;
+                test_ngl[id].n_layer++;
+                const std::vector<int64_t> test_mem = get_memory_for_layers(__func__, test_ngl, overflow_bufts);
+                const int64_t test_headroom = min_physical_headroom(test_mem);
+                if (test_headroom > best_headroom) {
+                    best_id = id;
+                    best_headroom = test_headroom;
+                    best_mem = test_mem;
+                }
+            }
+            GGML_ASSERT(best_id < nd);
+            physical_ngl[best_id].n_layer++;
+            physical_mem = std::move(best_mem);
+            n_gpu_layers++;
+        }
+
+        // Refine the boundary at the required layer count. Moving one layer between
+        // devices preserves the CPU prefix and finds the least-loaded contiguous split.
+        for (uint32_t iteration = 0; iteration < hp_ngl_paged * nd; ++iteration) {
+            const int64_t current_headroom = min_physical_headroom(physical_mem);
+            int64_t best_headroom = current_headroom;
+            std::vector<ngl_t> best_ngl;
+            std::vector<int64_t> best_mem;
+            for (size_t src = 0; src < nd; ++src) {
+                if (physical_ngl[src].n_layer == 0) {
+                    continue;
+                }
+                for (size_t dst = 0; dst < nd; ++dst) {
+                    if (src == dst) {
+                        continue;
+                    }
+                    std::vector<ngl_t> test_ngl = physical_ngl;
+                    test_ngl[src].n_layer--;
+                    test_ngl[dst].n_layer++;
+                    const std::vector<int64_t> test_mem = get_memory_for_layers(__func__, test_ngl, overflow_bufts);
+                    const int64_t test_headroom = min_physical_headroom(test_mem);
+                    if (test_headroom > best_headroom) {
+                        best_headroom = test_headroom;
+                        best_ngl = std::move(test_ngl);
+                        best_mem = test_mem;
+                    }
+                }
+            }
+            if (best_ngl.empty()) {
+                break;
+            }
+            physical_ngl = std::move(best_ngl);
+            physical_mem = std::move(best_mem);
+        }
+
+        constexpr int64_t hard_margin = 256*MiB;
+        if (min_physical_headroom(physical_mem) < hard_margin) {
+            throw common_params_fit_exception(
+                "paged layer mode could not keep all attention layers on GPU within physical device memory");
+        }
+
+        set_ngl_tensor_split_tbo(physical_ngl, overflow_bufts, *mparams);
+        for (size_t id = 0; id < nd; ++id) {
+            const int64_t projected_free = dmds_full[id].free - physical_mem[id];
+            LOG_WRN("%s:   - %s: %u layers, projected physical headroom=%" PRId64 " MiB\n",
+                __func__, dev_names[id].c_str(), physical_ngl[id].n_layer, projected_free/MiB);
+        }
     };
 
     int64_t global_surplus_cpu_moe = 0;
@@ -829,7 +972,7 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
-        set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+        set_final_layer_allocation(ngl_per_device, overflow_bufts);
         return;
     }
 
@@ -974,7 +1117,7 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
     }
 
-    set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+    set_final_layer_allocation(ngl_per_device, overflow_bufts);
 }
 
 static void common_expand_paged_context(

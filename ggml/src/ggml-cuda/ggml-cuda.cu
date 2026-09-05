@@ -1290,6 +1290,92 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
+static bool ggml_backend_cuda_comm_graph_compatible(void * comm_ctx_v) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+#ifdef GGML_USE_NCCL
+    if (comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_nccl) {
+        return true;
+    }
+#endif
+    // The internal two-GPU mapped-host kernel is replay-safe. Its large
+    // copy-engine path is kept eager by ggml_cuda_ar_allreduce().
+    return comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_internal;
+}
+
+static bool ggml_backend_cuda_comm_gather_graph_compatible(void * comm_ctx_v) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_internal) {
+        return false;
+    }
+#ifdef GGML_USE_NCCL
+    return comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_nccl;
+#else
+    return false;
+#endif
+}
+
+static bool ggml_backend_cuda_comm_gather_tensor(
+        void * comm_ctx_v, struct ggml_tensor ** src, struct ggml_tensor * dst) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->try_allreduce == ggml_backend_cuda_comm_try_allreduce_internal) {
+        return ggml_cuda_ar_gather(comm_ctx->ar_pipeline, comm_ctx->backends.data(), src, dst);
+    }
+#ifdef GGML_USE_NCCL
+    if (comm_ctx->try_allreduce != ggml_backend_cuda_comm_try_allreduce_nccl) {
+        return false;
+    }
+    const size_t n_backends = comm_ctx->backends.size();
+    if (n_backends < 2 || dst == nullptr || (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_I32)) {
+        return false;
+    }
+
+    const ncclDataType_t nccl_type = dst->type == GGML_TYPE_F32 ? ncclFloat : ncclInt32;
+    const int64_t n_rows = ggml_nrows(dst);
+    size_t row_offset = 0;
+
+    NCCL_CHECK(ncclGroupStart());
+    for (size_t j = 0; j < n_backends; ++j) {
+        GGML_ASSERT(src[j] != nullptr);
+        GGML_ASSERT(src[j]->type == dst->type);
+        GGML_ASSERT(ggml_nrows(src[j]) == n_rows);
+        GGML_ASSERT(ggml_is_contiguous(src[j]));
+
+        ggml_backend_cuda_context * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[j]->context);
+        for (int64_t row = 0; row < n_rows; ++row) {
+            void * src_row = static_cast<char *>(src[j]->data) + row * src[j]->nb[1];
+            void * dst_row = static_cast<char *>(dst->data) + row * dst->nb[1] + row_offset * dst->nb[0];
+            if (j == 0) {
+                ggml_cuda_set_device(cuda_ctx->device);
+                CUDA_CHECK(cudaMemcpyAsync(dst_row, src_row, ggml_row_size(src[j]->type, src[j]->ne[0]),
+                    cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+            } else {
+                NCCL_CHECK(ncclSend(src_row, src[j]->ne[0], nccl_type, 0, comm_ctx->comms[j], cuda_ctx->stream()));
+                ggml_backend_cuda_context * primary_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[0]->context);
+                NCCL_CHECK(ncclRecv(dst_row, src[j]->ne[0], nccl_type, (int) j, comm_ctx->comms[0], primary_ctx->stream()));
+            }
+        }
+        row_offset += src[j]->ne[0];
+    }
+    NCCL_CHECK(ncclGroupEnd());
+    GGML_ASSERT((int64_t) row_offset == dst->ne[0]);
+    return true;
+#else
+    GGML_UNUSED(src);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
 // host buffer type
 
 static const char * ggml_backend_cuda_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -2580,6 +2666,7 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 
 #ifdef USE_CUDA_GRAPH
 static constexpr int32_t GGML_TENSOR_FLAG_META_PRIMARY_INTERNAL = 128;
+static constexpr int32_t GGML_TENSOR_FLAG_META_CUDA_GRAPH_UNSAFE_INTERNAL = 256;
 
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
@@ -2591,6 +2678,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         ggml_tensor * node = cgraph->nodes[i];
 
         if (node->flags & GGML_TENSOR_FLAG_META_PRIMARY_INTERNAL) {
+            return false;
+        }
+
+        if (node->flags & GGML_TENSOR_FLAG_META_CUDA_GRAPH_UNSAFE_INTERNAL) {
             return false;
         }
 
@@ -4243,8 +4334,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
 
 #ifdef USE_CUDA_GRAPH
-        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
+            ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
             if (graph->graph != nullptr) {
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
                 graph->graph = nullptr;
@@ -4265,7 +4356,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            const cudaError_t err = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+            if (err != cudaSuccess) {
+                GGML_LOG_WARN("%s: cudaGraphInstantiate failed on device %d: %s; disabling this graph and falling back to eager execution\n",
+                    __func__, cuda_ctx->device, cudaGetErrorString(err));
+                (void) cudaGetLastError();
+                if (graph->graph != nullptr) {
+                    CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                    graph->graph = nullptr;
+                }
+                graph->disable_due_to_capture_error = true;
+                ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, nullptr);
+                return;
+            }
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
@@ -4294,6 +4397,131 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
     return graph->is_enabled();
 }
+
+struct ggml_cuda_external_graph {
+    cudaGraph_t     graph    = nullptr;
+    cudaGraphExec_t instance = nullptr;
+
+    ~ggml_cuda_external_graph() {
+        if (instance != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(instance));
+        }
+        if (graph != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph));
+        }
+    }
+};
+
+static bool ggml_backend_cuda_graph_capture_compatible(ggml_backend_t backend, const ggml_cgraph * cgraph) {
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr ||
+            ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+        return false;
+    }
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT_ID &&
+                ggml_cuda_mul_mat_id_needs_sync(node, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_backend_cuda_graph_capture_begin(ggml_backend_t backend) {
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    GGML_ASSERT(!cuda_ctx->external_graph_capture);
+    GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    const cudaError_t err = cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed);
+    if (err != cudaSuccess) {
+        GGML_LOG_WARN("%s: cudaStreamBeginCapture failed on device %d: %s\n",
+            __func__, cuda_ctx->device, cudaGetErrorString(err));
+        (void) cudaGetLastError();
+        return false;
+    }
+
+    cuda_ctx->external_graph_capture = true;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+static void * ggml_backend_cuda_graph_capture_end(ggml_backend_t backend) {
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    GGML_ASSERT(cuda_ctx->external_graph_capture);
+    GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    auto graph = std::make_unique<ggml_cuda_external_graph>();
+    const cudaError_t end_err = cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph);
+    cuda_ctx->external_graph_capture = false;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+            ggml_cuda_lock_cv.notify_all();
+        }
+    }
+
+    if (end_err != cudaSuccess || graph->graph == nullptr) {
+        GGML_LOG_WARN("%s: cudaStreamEndCapture failed on device %d: %s\n",
+            __func__, cuda_ctx->device, cudaGetErrorString(end_err));
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+
+    return graph.release();
+}
+
+static bool ggml_backend_cuda_graph_capture_finalize(ggml_backend_t backend, void * graph_v) {
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    auto * graph = static_cast<ggml_cuda_external_graph *>(graph_v);
+    GGML_ASSERT(graph != nullptr && graph->graph != nullptr && graph->instance == nullptr);
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    const cudaError_t instantiate_err = cudaGraphInstantiate(&graph->instance, graph->graph, nullptr, nullptr, 0);
+    if (instantiate_err != cudaSuccess) {
+        GGML_LOG_WARN("%s: cudaGraphInstantiate failed on device %d: %s\n",
+            __func__, cuda_ctx->device, cudaGetErrorString(instantiate_err));
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_backend_cuda_graph_capture_launch(ggml_backend_t backend, void * graph_v) {
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    auto * graph = static_cast<ggml_cuda_external_graph *>(graph_v);
+    GGML_ASSERT(graph != nullptr && graph->instance != nullptr);
+    GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    const cudaError_t err = cudaGraphLaunch(graph->instance, cuda_ctx->stream());
+    if (err != cudaSuccess) {
+        GGML_LOG_WARN("%s: cudaGraphLaunch failed on device %d: %s\n",
+            __func__, cuda_ctx->device, cudaGetErrorString(err));
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+static void ggml_backend_cuda_graph_capture_free(ggml_backend_t backend, void * graph_v) {
+    if (graph_v == nullptr) {
+        return;
+    }
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    ggml_cuda_set_device(cuda_ctx->device);
+    delete static_cast<ggml_cuda_external_graph *>(graph_v);
+}
 #endif // USE_CUDA_GRAPH
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -4306,34 +4534,36 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cgraph);
+    if (!cuda_ctx->external_graph_capture) {
+        graph_key = ggml_cuda_graph_get_key(cgraph);
 
-    ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+        ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
-        if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        if (graph->is_enabled()) {
+            const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+            if (graph_compatible) {
+                const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
-            if (!graph->warmup_complete) {
-                // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (!properties_changed) {
-                    graph->warmup_complete = true;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
-                    use_cuda_graph = true;
-                    cuda_graph_update_required = true;
-                }
-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
-            } else {
-                // Post-warmup: normal CUDA graph operation
-                if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
-                    graph->warmup_complete = false;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                if (!graph->warmup_complete) {
+                    // Warmup: need at least 2 calls with no property change on the 2nd call
+                    if (!properties_changed) {
+                        graph->warmup_complete = true;
+                        GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+                        use_cuda_graph = true;
+                        cuda_graph_update_required = true;
+                    }
+                    // else: properties changed or first call - execute directly (use_cuda_graph stays false)
                 } else {
-                    use_cuda_graph = true;
-                    cuda_graph_update_required = graph->instance == nullptr;
+                    // Post-warmup: normal CUDA graph operation
+                    if (properties_changed) {
+                        // Properties changed - reset warmup, execute directly until stable again
+                        graph->warmup_complete = false;
+                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    } else {
+                        use_cuda_graph = true;
+                        cuda_graph_update_required = graph->instance == nullptr;
+                    }
                 }
             }
         }
@@ -5545,6 +5775,35 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
     }
+    if (strcmp(name, "ggml_backend_comm_gather_tensor") == 0) {
+        return (void *)ggml_backend_cuda_comm_gather_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_graph_compatible") == 0) {
+        return (void *)ggml_backend_cuda_comm_graph_compatible;
+    }
+    if (strcmp(name, "ggml_backend_comm_gather_graph_compatible") == 0) {
+        return (void *)ggml_backend_cuda_comm_gather_graph_compatible;
+    }
+#ifdef USE_CUDA_GRAPH
+    if (strcmp(name, "ggml_backend_graph_capture_compatible") == 0) {
+        return (void *)ggml_backend_cuda_graph_capture_compatible;
+    }
+    if (strcmp(name, "ggml_backend_graph_capture_begin") == 0) {
+        return (void *)ggml_backend_cuda_graph_capture_begin;
+    }
+    if (strcmp(name, "ggml_backend_graph_capture_end") == 0) {
+        return (void *)ggml_backend_cuda_graph_capture_end;
+    }
+    if (strcmp(name, "ggml_backend_graph_capture_finalize") == 0) {
+        return (void *)ggml_backend_cuda_graph_capture_finalize;
+    }
+    if (strcmp(name, "ggml_backend_graph_capture_launch") == 0) {
+        return (void *)ggml_backend_cuda_graph_capture_launch;
+    }
+    if (strcmp(name, "ggml_backend_graph_capture_free") == 0) {
+        return (void *)ggml_backend_cuda_graph_capture_free;
+    }
+#endif
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
     }

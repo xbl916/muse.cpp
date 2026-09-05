@@ -9,6 +9,7 @@
 
 #include "server-common.h"
 
+#include <cmath>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -82,6 +83,13 @@ json server_slot_stats::to_json() const {
     if (n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;
+    }
+
+    if (spec_adaptive_hard_off) {
+        base["spec_adaptive_hard_off"]   = true;
+        base["spec_adaptive_switch_gen"] = spec_adaptive_switch_gen;
+        base["spec_adaptive_acceptance"] = spec_adaptive_acceptance;
+        base["spec_adaptive_empty_rate"] = spec_adaptive_empty_rate;
     }
 
     return base;
@@ -1331,6 +1339,33 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    std::string resolved_reasoning_effort;
+    if (inputs.enable_thinking) {
+        const auto it = inputs.chat_template_kwargs.find("reasoning_effort");
+        if (it != inputs.chat_template_kwargs.end()) {
+            try {
+                const auto value = json::parse(it->second);
+                if (value.is_string()) {
+                    resolved_reasoning_effort = value.get<std::string>();
+                }
+            } catch (const std::exception &) {
+                throw std::invalid_argument("invalid reasoning_effort template argument");
+            }
+        }
+    }
+
+    std::string native_reasoning_effort = resolved_reasoning_effort;
+    const std::string template_source = common_chat_templates_source(opt.tmpls.get());
+    const bool template_uses_xhigh = template_source.find("reasoning_effort") != std::string::npos &&
+            template_source.find("xhigh") != std::string::npos;
+    if (native_reasoning_effort == "high" && template_uses_xhigh) {
+        native_reasoning_effort = "xhigh";
+        inputs.chat_template_kwargs["reasoning_effort"] = json(native_reasoning_effort).dump();
+    }
+
+    const bool has_explicit_reasoning_budget =
+        (body.contains("reasoning_budget_tokens") && !body.at("reasoning_budget_tokens").is_null()) ||
+        (body.contains("thinking_budget_tokens") && !body.at("thinking_budget_tokens").is_null());
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
@@ -1362,18 +1397,145 @@ json oaicompat_chat_params_parse(
 
     // Reasoning budget: pass parameters through to sampling layer
     {
-        int reasoning_budget = json_value(body, "reasoning_budget_tokens",
+        int reasoning_budget = -1;
+        const char * budget_source = "disabled";
+        if (has_explicit_reasoning_budget) {
+            reasoning_budget = json_value(body, "reasoning_budget_tokens",
                                json_value(body, "thinking_budget_tokens", -1));
-        if (reasoning_budget == -1) {
-            reasoning_budget = opt.reasoning_budget;
+            budget_source = "request";
+        } else {
+            const auto it = opt.reasoning_budget_by_effort.find(resolved_reasoning_effort);
+            if (it != opt.reasoning_budget_by_effort.end()) {
+                reasoning_budget = it->second;
+                budget_source = "effort";
+            } else if (!resolved_reasoning_effort.empty() && !opt.reasoning_budget_by_effort.empty()) {
+                // Once effort budgets are configured, an explicitly selected
+                // but unconfigured effort remains unrestricted.
+                reasoning_budget = -1;
+                budget_source = "unconfigured";
+            } else {
+                reasoning_budget = opt.reasoning_budget;
+                budget_source = reasoning_budget >= 0 ? "global" : "disabled";
+            }
         }
+
+        float converge_ratio = -1.0f;
+        int converge_tokens = -1;
+        const char * converge_source = "disabled";
+        const auto converge_ratio_it = opt.reasoning_converge_ratio_by_effort.find(resolved_reasoning_effort);
+        const auto converge_tokens_it = opt.reasoning_converge_tokens_by_effort.find(resolved_reasoning_effort);
+        if (converge_ratio_it != opt.reasoning_converge_ratio_by_effort.end() &&
+                converge_tokens_it != opt.reasoning_converge_tokens_by_effort.end()) {
+            converge_ratio = converge_ratio_it->second;
+            converge_tokens = converge_tokens_it->second;
+            converge_source = "effort";
+        }
+        if (body.contains("reasoning_converge_ratio") || body.contains("reasoning_converge_tokens")) {
+            converge_ratio = json_value(body, "reasoning_converge_ratio", converge_ratio);
+            converge_tokens = json_value(body, "reasoning_converge_tokens", converge_tokens);
+            converge_source = "request";
+        }
+
+        int converge_bias_delay = opt.reasoning_converge_bias_delay_tokens;
+        const auto converge_bias_delay_it = opt.reasoning_converge_bias_delay_by_effort.find(resolved_reasoning_effort);
+        if (converge_bias_delay_it != opt.reasoning_converge_bias_delay_by_effort.end()) {
+            converge_bias_delay = converge_bias_delay_it->second;
+        }
+        converge_bias_delay = json_value(
+                body, "reasoning_handoff_bias_delay_tokens", converge_bias_delay);
+
+        float soft_ratio = opt.reasoning_budget_soft_ratio;
+        soft_ratio = json_value(body, "reasoning_budget_soft_ratio", soft_ratio);
+        const std::string soft_message = json_value(
+                body, "reasoning_budget_soft_message", opt.reasoning_budget_soft_message);
+        const std::string hard_message = json_value(
+                body, "reasoning_budget_message", opt.reasoning_budget_message);
+        const std::string converge_marker = json_value(
+                body, "reasoning_converge_marker", opt.reasoning_converge_marker);
+        const std::string converge_message = json_value(
+                body, "reasoning_handoff_transition",
+                json_value(body, "reasoning_handoff_prefix",
+                json_value(body, "reasoning_converge_message", opt.reasoning_converge_message)));
+        const int soft_boundary_tokens = json_value(
+                body, "reasoning_budget_soft_boundary_tokens", opt.reasoning_budget_soft_boundary_tokens);
+        const int grace_tokens = json_value(
+                body, "reasoning_budget_grace_tokens", opt.reasoning_budget_grace_tokens);
+        const int converge_boundary_tokens = json_value(
+                body, "reasoning_converge_boundary_tokens", opt.reasoning_converge_boundary_tokens);
+        const float converge_max_bias = json_value(
+                body, "reasoning_converge_max_bias", opt.reasoning_converge_max_bias);
+        int hard_boundary_tokens = json_value(
+                body, "reasoning_hard_boundary_tokens", opt.reasoning_hard_boundary_tokens);
+        if (!body.contains("reasoning_hard_boundary_tokens") && grace_tokens > 0) {
+            hard_boundary_tokens = grace_tokens;
+        }
+
+        if (!inputs.enable_thinking) {
+            reasoning_budget = -1;
+            converge_ratio = -1.0f;
+            converge_tokens = -1;
+            converge_bias_delay = 0;
+            soft_ratio = -1.0f;
+            budget_source = "disabled";
+            converge_source = "disabled";
+        }
+
+        const bool convergence_enabled = reasoning_budget > 0 &&
+                converge_ratio > 0.0f && converge_ratio < 1.0f &&
+                converge_tokens >= 0;
+        if (!convergence_enabled) {
+            converge_ratio = -1.0f;
+            converge_tokens = -1;
+            converge_source = "disabled";
+        }
+        const int effective_converge_boundary_tokens = convergence_enabled ? converge_boundary_tokens : 0;
+        const float effective_converge_max_bias = convergence_enabled ? converge_max_bias : 0.0f;
+        const int effective_hard_boundary_tokens = inputs.enable_thinking ? hard_boundary_tokens : 0;
+        const int effective_soft_boundary_tokens = inputs.enable_thinking ? soft_boundary_tokens : 0;
+        const int effective_grace_tokens = inputs.enable_thinking ? grace_tokens : 0;
+        const int converge_at = convergence_enabled ?
+                (int) std::ceil((double) reasoning_budget * converge_ratio) : -1;
+        const int converge_tokens_effective = convergence_enabled ?
+                std::min(converge_tokens, std::max(0, reasoning_budget - converge_at)) : -1;
+        const int converge_bias_delay_effective = convergence_enabled ?
+                std::min(converge_bias_delay, std::max(0, converge_tokens_effective)) : 0;
+        const std::string effort_label = !inputs.enable_thinking ? "none" :
+                (resolved_reasoning_effort.empty() ? "default" : resolved_reasoning_effort);
+        const std::string native_effort_label = !inputs.enable_thinking ? "none" :
+                (native_reasoning_effort.empty() ? "default" : native_reasoning_effort);
+        const std::string soft_message_log = json(soft_message).dump();
+        const std::string hard_message_log = json(hard_message).dump();
+        const std::string converge_marker_log = json(converge_marker).dump();
+        const std::string converge_message_log = json(converge_message).dump();
+        SRV_INF("reasoning request: effort=%s, native_effort=%s, thinking=%s, budget=%d, budget_source=%s, handoff_mode=%s, handoff_ratio=%.2f, handoff_at=%d, handoff_gate=%d, handoff_source=%s, handoff_boundary=%d, handoff_marker=%s, handoff_transition=%s, hard_boundary=%d, legacy_soft_ratio=%.2f, legacy_soft_boundary=%d, legacy_grace=%d, soft_message=%s, hard_message=%s\n",
+                effort_label.c_str(), native_effort_label.c_str(), inputs.enable_thinking ? "enabled" : "disabled",
+                reasoning_budget, budget_source, convergence_enabled ? "deterministic_two_stage_handoff" : "disabled",
+                converge_ratio, converge_at, converge_tokens,
+                converge_source, effective_converge_boundary_tokens,
+                converge_marker_log.c_str(), converge_message_log.c_str(), effective_hard_boundary_tokens,
+                soft_ratio,
+                effective_soft_boundary_tokens, effective_grace_tokens,
+                soft_message_log.c_str(), hard_message_log.c_str());
 
         if (!chat_params.thinking_end_tags.empty()) {
             llama_params["reasoning_budget_tokens"] = reasoning_budget;
             llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
             llama_params["reasoning_budget_end_tags"] = chat_params.thinking_end_tags;
-            llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
-            llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
+            llama_params["reasoning_budget_message"] = hard_message;
+            llama_params["reasoning_converge_ratio"] = converge_ratio;
+            llama_params["reasoning_converge_tokens"] = converge_tokens;
+            llama_params["reasoning_converge_marker"] = converge_marker;
+            llama_params["reasoning_converge_message"] = converge_message;
+            llama_params["reasoning_converge_boundary_tokens"] = effective_converge_boundary_tokens;
+            llama_params["reasoning_handoff_bias_delay_tokens"] = converge_bias_delay_effective;
+            llama_params["reasoning_converge_max_bias"] = effective_converge_max_bias;
+            llama_params["reasoning_hard_boundary_tokens"] = effective_hard_boundary_tokens;
+            llama_params["reasoning_budget_soft_ratio"] = soft_ratio;
+            llama_params["reasoning_budget_soft_message"] = soft_message;
+            llama_params["reasoning_budget_soft_boundary_tokens"] = effective_soft_boundary_tokens;
+            // The legacy grace setting is resolved into reasoning_hard_boundary_tokens above.
+            llama_params["reasoning_budget_grace_tokens"] = 0;
+            llama_params["reasoning_control"] = inputs.enable_thinking && json_value(body, "reasoning_control", false);
         }
     }
 

@@ -1775,6 +1775,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_BLOCK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--paged-attn-sink"}, "N",
+        string_format("tokens kept at the start of sparse paged decode attention (default: %d)", params.paged_attn_sink),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("paged attention sink must be non-negative");
+            }
+            params.paged_attn_sink = value;
+        }
+    ).set_env("LLAMA_ARG_PAGED_ATTN_SINK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--paged-attn-window"}, "N",
+        string_format("recent tokens kept by sparse paged decode attention (default: %d, 0 = disabled)", params.paged_attn_window),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("paged attention window must be non-negative");
+            }
+            params.paged_attn_window = value;
+        }
+    ).set_env("LLAMA_ARG_PAGED_ATTN_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--paged-prefill-chunk"}, "N",
         string_format("maximum prompt tokens scheduled while requests are generating (default: %d, 0 = disabled)", params.paged_prefill_chunk),
         [](common_params & params, int value) {
@@ -3851,6 +3871,233 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
     add_opt(common_arg(
+        {"--reasoning-budget-low"}, "N",
+        "thinking token budget selected when reasoning_effort is 'low'; -1 leaves this effort unconfigured (default: -1)",
+        [](common_params & params, int value) {
+            if (value < -1) { throw std::invalid_argument("invalid value"); }
+            if (value == -1) params.sampling.reasoning_budget_by_effort.erase("low");
+            else params.sampling.reasoning_budget_by_effort["low"] = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_THINK_BUDGET_LOW"));
+    add_opt(common_arg(
+        {"--reasoning-budget-medium"}, "N",
+        "thinking token budget selected when reasoning_effort is 'medium'; -1 leaves this effort unconfigured (default: -1)",
+        [](common_params & params, int value) {
+            if (value < -1) { throw std::invalid_argument("invalid value"); }
+            if (value == -1) params.sampling.reasoning_budget_by_effort.erase("medium");
+            else params.sampling.reasoning_budget_by_effort["medium"] = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_THINK_BUDGET_MEDIUM"));
+    add_opt(common_arg(
+        {"--reasoning-budget-high"}, "N",
+        "thinking token budget selected when reasoning_effort is 'high'; -1 leaves this effort unconfigured (default: -1)",
+        [](common_params & params, int value) {
+            if (value < -1) { throw std::invalid_argument("invalid value"); }
+            if (value == -1) params.sampling.reasoning_budget_by_effort.erase("high");
+            else params.sampling.reasoning_budget_by_effort["high"] = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_THINK_BUDGET_HIGH"));
+    add_opt(common_arg(
+        {"--reasoning-budget-xhigh"}, "N",
+        "thinking token budget selected when reasoning_effort is 'xhigh'; -1 leaves this effort unconfigured (default: -1)",
+        [](common_params & params, int value) {
+            if (value < -1) { throw std::invalid_argument("invalid value"); }
+            if (value == -1) params.sampling.reasoning_budget_by_effort.erase("xhigh");
+            else params.sampling.reasoning_budget_by_effort["xhigh"] = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_THINK_BUDGET_XHIGH"));
+    add_opt(common_arg(
+        {"--reasoning-converge-ratio-low"}, "N",
+        "fraction of the low reasoning budget at which to lock the plan and begin convergence; -1 leaves it unconfigured",
+        [](common_params & params, const std::string & value) {
+            const float ratio = std::stof(value);
+            if (ratio != -1.0f && (!std::isfinite(ratio) || ratio <= 0.0f || ratio >= 1.0f)) throw std::invalid_argument("invalid value");
+            if (ratio == -1.0f) params.sampling.reasoning_converge_ratio_by_effort.erase("low");
+            else params.sampling.reasoning_converge_ratio_by_effort["low"] = ratio;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_CONVERGE_RATIO_LOW"));
+    add_opt(common_arg(
+        {"--reasoning-converge-ratio-medium"}, "N",
+        "fraction of the medium reasoning budget at which to lock the plan and begin convergence; -1 leaves it unconfigured",
+        [](common_params & params, const std::string & value) {
+            const float ratio = std::stof(value);
+            if (ratio != -1.0f && (!std::isfinite(ratio) || ratio <= 0.0f || ratio >= 1.0f)) throw std::invalid_argument("invalid value");
+            if (ratio == -1.0f) params.sampling.reasoning_converge_ratio_by_effort.erase("medium");
+            else params.sampling.reasoning_converge_ratio_by_effort["medium"] = ratio;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_CONVERGE_RATIO_MEDIUM"));
+    add_opt(common_arg(
+        {"--reasoning-converge-ratio-high"}, "N",
+        "fraction of the high reasoning budget at which to lock the plan and begin convergence; -1 leaves it unconfigured",
+        [](common_params & params, const std::string & value) {
+            const float ratio = std::stof(value);
+            if (ratio != -1.0f && (!std::isfinite(ratio) || ratio <= 0.0f || ratio >= 1.0f)) throw std::invalid_argument("invalid value");
+            if (ratio == -1.0f) params.sampling.reasoning_converge_ratio_by_effort.erase("high");
+            else params.sampling.reasoning_converge_ratio_by_effort["high"] = ratio;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_CONVERGE_RATIO_HIGH"));
+    add_opt(common_arg(
+        {"--reasoning-converge-ratio-xhigh"}, "N",
+        "fraction of the xhigh reasoning budget at which to lock the plan and begin convergence; -1 leaves it unconfigured",
+        [](common_params & params, const std::string & value) {
+            const float ratio = std::stof(value);
+            if (ratio != -1.0f && (!std::isfinite(ratio) || ratio <= 0.0f || ratio >= 1.0f)) throw std::invalid_argument("invalid value");
+            if (ratio == -1.0f) params.sampling.reasoning_converge_ratio_by_effort.erase("xhigh");
+            else params.sampling.reasoning_converge_ratio_by_effort["xhigh"] = ratio;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_CONVERGE_RATIO_XHIGH"));
+    add_opt(common_arg(
+        {"--reasoning-converge-tokens-low"}, "N",
+        "non-negative enables low-effort deterministic handoff; value retained for compatibility; -1 leaves it unconfigured",
+        [](common_params & params, int value) {
+            if (value < -1) throw std::invalid_argument("invalid value");
+            if (value == -1) params.sampling.reasoning_converge_tokens_by_effort.erase("low");
+            else params.sampling.reasoning_converge_tokens_by_effort["low"] = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_CONVERGE_TOKENS_LOW"));
+    add_opt(common_arg(
+        {"--reasoning-converge-tokens-medium"}, "N",
+        "non-negative enables medium-effort deterministic handoff; value retained for compatibility; -1 leaves it unconfigured",
+        [](common_params & params, int value) {
+            if (value < -1) throw std::invalid_argument("invalid value");
+            if (value == -1) params.sampling.reasoning_converge_tokens_by_effort.erase("medium");
+            else params.sampling.reasoning_converge_tokens_by_effort["medium"] = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_CONVERGE_TOKENS_MEDIUM"));
+    add_opt(common_arg(
+        {"--reasoning-converge-tokens-high"}, "N",
+        "non-negative enables high-effort deterministic handoff; value retained for compatibility; -1 leaves it unconfigured",
+        [](common_params & params, int value) {
+            if (value < -1) throw std::invalid_argument("invalid value");
+            if (value == -1) params.sampling.reasoning_converge_tokens_by_effort.erase("high");
+            else params.sampling.reasoning_converge_tokens_by_effort["high"] = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_CONVERGE_TOKENS_HIGH"));
+    add_opt(common_arg(
+        {"--reasoning-converge-tokens-xhigh"}, "N",
+        "non-negative enables xhigh-effort deterministic handoff; value retained for compatibility; -1 leaves it unconfigured",
+        [](common_params & params, int value) {
+            if (value < -1) throw std::invalid_argument("invalid value");
+            if (value == -1) params.sampling.reasoning_converge_tokens_by_effort.erase("xhigh");
+            else params.sampling.reasoning_converge_tokens_by_effort["xhigh"] = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_CONVERGE_TOKENS_XHIGH"));
+    add_opt(common_arg(
+        {"--reasoning-handoff-bias-delay-low"}, "N",
+        "compatibility option ignored by deterministic two-stage handoff",
+        [](common_params & params, int value) {
+            if (value < -1) throw std::invalid_argument("invalid value");
+            if (value == -1) params.sampling.reasoning_converge_bias_delay_by_effort.erase("low");
+            else params.sampling.reasoning_converge_bias_delay_by_effort["low"] = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_HANDOFF_BIAS_DELAY_LOW"));
+    add_opt(common_arg(
+        {"--reasoning-handoff-bias-delay-medium"}, "N",
+        "compatibility option ignored by deterministic two-stage handoff",
+        [](common_params & params, int value) {
+            if (value < -1) throw std::invalid_argument("invalid value");
+            if (value == -1) params.sampling.reasoning_converge_bias_delay_by_effort.erase("medium");
+            else params.sampling.reasoning_converge_bias_delay_by_effort["medium"] = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_HANDOFF_BIAS_DELAY_MEDIUM"));
+    add_opt(common_arg(
+        {"--reasoning-handoff-bias-delay-high"}, "N",
+        "compatibility option ignored by deterministic two-stage handoff",
+        [](common_params & params, int value) {
+            if (value < -1) throw std::invalid_argument("invalid value");
+            if (value == -1) params.sampling.reasoning_converge_bias_delay_by_effort.erase("high");
+            else params.sampling.reasoning_converge_bias_delay_by_effort["high"] = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_HANDOFF_BIAS_DELAY_HIGH"));
+    add_opt(common_arg(
+        {"--reasoning-handoff-bias-delay-xhigh"}, "N",
+        "compatibility option ignored by deterministic two-stage handoff",
+        [](common_params & params, int value) {
+            if (value < -1) throw std::invalid_argument("invalid value");
+            if (value == -1) params.sampling.reasoning_converge_bias_delay_by_effort.erase("xhigh");
+            else params.sampling.reasoning_converge_bias_delay_by_effort["xhigh"] = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_HANDOFF_BIAS_DELAY_XHIGH"));
+    add_opt(common_arg(
+        {"--reasoning-converge-marker"}, "TEXT",
+        "optional marker prefixed to the one-shot reasoning handoff prefix (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_converge_marker = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_CONVERGE_MARKER"));
+    add_opt(common_arg(
+        {"--reasoning-handoff-prefix", "--reasoning-converge-message", "--reasoning-handoff-transition"}, "TEXT",
+        "transition sentence forced at the two-stage handoff before the native reasoning end tag; empty closes reasoning directly",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_converge_message = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_CONVERGE_MESSAGE"));
+    add_opt(common_arg(
+        {"--reasoning-converge-boundary-tokens"}, "N",
+        "maximum tokens to wait for a safe text boundary before deterministic two-stage handoff (default: 96)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_converge_boundary_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_CONVERGE_BOUNDARY_TOKENS"));
+    add_opt(common_arg(
+        {"--reasoning-handoff-bias-delay-tokens"}, "N",
+        "compatibility option retained from the legacy biased-convergence mode; ignored by deterministic two-stage handoff",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_converge_bias_delay_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_HANDOFF_BIAS_DELAY_TOKENS"));
+    add_opt(common_arg(
+        {"--reasoning-converge-max-bias"}, "N",
+        "compatibility option retained from the legacy biased-convergence mode; ignored by deterministic two-stage handoff",
+        [](common_params & params, const std::string & value) {
+            const float bias = std::stof(value);
+            if (!std::isfinite(bias) || bias < 0.0f) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_converge_max_bias = bias;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_CONVERGE_MAX_BIAS"));
+    add_opt(common_arg(
+        {"--reasoning-hard-boundary-tokens"}, "N",
+        "maximum tokens to wait for a line boundary before forcing the reasoning end tag (default: 96)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_hard_boundary_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_HARD_BOUNDARY_TOKENS"));
+    add_opt(common_arg(
+        {"--reasoning-budget-soft-ratio"}, "N",
+        "legacy fraction of a configured thinking budget at which to inject a one-time wrap-up hint; -1 disables, 0 < N < 1 enables",
+        [](common_params & params, const std::string & value) {
+            const float ratio = std::stof(value);
+            if (ratio != -1.0f && (ratio <= 0.0f || ratio >= 1.0f)) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_budget_soft_ratio = ratio;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_SOFT_RATIO"));
+    add_opt(common_arg(
+        {"--reasoning-budget-soft-message"}, "MESSAGE",
+        "one-time wrap-up hint injected at the soft reasoning-budget threshold",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_budget_soft_message = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_SOFT_MESSAGE"));
+    add_opt(common_arg(
+        {"--reasoning-budget-soft-boundary-tokens"}, "N",
+        "maximum tokens to wait for a safe text boundary before injecting the soft reasoning-budget hint (default: 64)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_budget_soft_boundary_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_SOFT_BOUNDARY_TOKENS"));
+    add_opt(common_arg(
+        {"--reasoning-budget-grace-tokens"}, "N",
+        "extra thinking tokens allowed after the budget before forcing the end tag (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_budget_grace_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_GRACE_TOKENS"));
+    add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
         "preserve reasoning trace in the full history, not just the last assistant message (default: template default)\n"
@@ -4076,6 +4323,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             common_log_set_timestamps(common_log_main(), value);
         }
     ).set_env("LLAMA_ARG_LOG_TIMESTAMPS"));
+    add_opt(common_arg(
+        {"--log-wall-clock"},
+        {"--no-log-wall-clock"},
+        "Use local wall-clock timestamps (YYYY-MM-DD HH:MM:SS.mmm) instead of elapsed time",
+        [](common_params &, bool value) {
+            common_log_set_wall_clock(common_log_main(), value);
+        }
+    ).set_env("LLAMA_ARG_LOG_WALL_CLOCK"));
 
     //
     // speculative parameters
@@ -4276,6 +4531,99 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
     add_opt(common_arg(
+        {"--spec-adaptive"},
+        {"--no-spec-adaptive"},
+        string_format("adaptively hard-disable MTP for the rest of a request when recent draft acceptance is too low (default: %s)",
+                      params.speculative.draft.adaptive ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.adaptive = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ADAPTIVE"));
+    add_opt(common_arg(
+        {"--spec-adaptive-window"}, "N",
+        string_format("number of MTP draft attempts per adaptive evaluation window (default: %d)", params.speculative.draft.adaptive_window),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.adaptive_window = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ADAPTIVE_WINDOW"));
+    add_opt(common_arg(
+        {"--spec-adaptive-min-gen"}, "N",
+        string_format("minimum generated tokens before adaptive MTP can switch off (default: %d)", params.speculative.draft.adaptive_min_gen),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.adaptive_min_gen = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ADAPTIVE_MIN_GEN"));
+    add_opt(common_arg(
+        {"--spec-adaptive-min-context"}, "N",
+        string_format("minimum total context tokens before adaptive MTP can switch off (default: %d)", params.speculative.draft.adaptive_min_context),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.adaptive_min_context = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ADAPTIVE_MIN_CONTEXT"));
+    add_opt(common_arg(
+        {"--spec-adaptive-min-accept"}, "P",
+        string_format("minimum accepted/generated MTP draft-token ratio per window (default: %.2f)",
+                      (double) params.speculative.draft.adaptive_min_accept),
+        [](common_params & params, const std::string & value) {
+            const float p = std::stof(value);
+            if (!std::isfinite(p) || p < 0.0f || p > 1.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.adaptive_min_accept = p;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ADAPTIVE_MIN_ACCEPT"));
+    add_opt(common_arg(
+        {"--spec-adaptive-max-empty-rate"}, "P",
+        string_format("maximum fraction of MTP attempts producing no usable draft per window (default: %.2f)",
+                      (double) params.speculative.draft.adaptive_max_empty_rate),
+        [](common_params & params, const std::string & value) {
+            const float p = std::stof(value);
+            if (!std::isfinite(p) || p < 0.0f || p > 1.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.adaptive_max_empty_rate = p;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ADAPTIVE_MAX_EMPTY_RATE"));
+    add_opt(common_arg(
+        {"--spec-adaptive-patience"}, "N",
+        string_format("consecutive bad adaptive MTP windows required before hard-off (default: %d)", params.speculative.draft.adaptive_patience),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.adaptive_patience = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ADAPTIVE_PATIENCE"));
+    add_opt(common_arg(
+        {"--spec-adaptive-reasoning-hard-off"},
+        {"--no-spec-adaptive-reasoning-hard-off"},
+        string_format("allow adaptive MTP hard-off during reasoning (default: %s)",
+                      params.speculative.draft.adaptive_reasoning_hard_off ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.adaptive_reasoning_hard_off = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ADAPTIVE_REASONING_HARD_OFF"));
+    add_opt(common_arg(
+        {"--spec-acceptance-log-tokens", "--mtp-acceptance-log-tokens"}, "N",
+        string_format("generated-token interval for per-request MTP acceptance progress logs; 0 disables (default: %d)",
+                      params.speculative.draft.acceptance_log_tokens),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.acceptance_log_tokens = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_ACCEPTANCE_LOG_TOKENS"));
+    add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
         [](common_params & params, const std::string & value) {
@@ -4331,6 +4679,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.backend_sampling = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
+    add_opt(common_arg(
+        {"--spec-draft-probabilistic"},
+        {"--no-spec-draft-probabilistic"},
+        string_format("sample MTP drafts probabilistically and use p/q rejection verification (default: %s)",
+                      params.speculative.draft.probabilistic ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.probabilistic = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_PROBABILISTIC"));
     add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"

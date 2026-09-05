@@ -49,12 +49,13 @@ struct llama_context {
 
     ~llama_context();
 
-    // reserve a new backend scheduler (if needed)
+    // update the backend scheduler (if needed)
     // for example, when:
     //   - changing loras
-    //   - changing samplers
     //   - changing attention type
     //   - etc.
+    // Sampler-only changes use a lightweight graph reset when the current
+    // scheduler already has enough node capacity.
     void sched_reserve();
 
     void synchronize();
@@ -371,6 +372,8 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    bool sched_need_reset = false;
+    size_t sched_max_nodes = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

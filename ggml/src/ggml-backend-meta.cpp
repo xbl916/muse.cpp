@@ -12,11 +12,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -27,6 +29,7 @@ struct ggml_backend_meta;
 
 static constexpr int32_t GGML_TENSOR_FLAG_META_LOCAL_TOP_K_INTERNAL = 64;
 static constexpr int32_t GGML_TENSOR_FLAG_META_PRIMARY_INTERNAL = 128;
+static constexpr int32_t GGML_TENSOR_FLAG_META_CUDA_GRAPH_UNSAFE_INTERNAL = 256;
 
 const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis) {
     switch (split_axis) {
@@ -1225,6 +1228,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(tensor->buffer));
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    }
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
 }
@@ -1879,9 +1886,32 @@ struct ggml_backend_meta_context {
     size_t                      max_subgraphs = 0;
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
+    uint64_t                    capture_key   = 0;
+    int64_t                     capture_batch = 0;
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    ggml_backend_comm_gather_tensor_t    comm_gather    = nullptr;
+    ggml_backend_comm_graph_compatible_t comm_graph_compatible = nullptr;
+    ggml_backend_comm_gather_graph_compatible_t comm_gather_graph_compatible = nullptr;
+
+    ggml_backend_graph_capture_compatible_t graph_capture_compatible = nullptr;
+    ggml_backend_graph_capture_begin_t      graph_capture_begin      = nullptr;
+    ggml_backend_graph_capture_end_t        graph_capture_end        = nullptr;
+    ggml_backend_graph_capture_finalize_t   graph_capture_finalize   = nullptr;
+    ggml_backend_graph_capture_launch_t     graph_capture_launch     = nullptr;
+    ggml_backend_graph_capture_free_t       graph_capture_free       = nullptr;
+
+    struct captured_graph {
+        std::vector<void *> handles;
+        int                 warmups = 0;
+        bool                failed  = false;
+    };
+    std::unordered_map<uint64_t, captured_graph> captured_graphs;
+    std::vector<ggml_backend_event_t> graph_completion_events;
+    bool   capture_requested = false;
+    size_t capture_max_batch = 8;
+    size_t capture_max_graphs = 16;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -1901,27 +1931,105 @@ struct ggml_backend_meta_context {
         }
         name += ")";
 
+        const char * capture_env = getenv("GGML_CUDA_TP_GRAPHS");
+        capture_requested = capture_env != nullptr && strcmp(capture_env, "0") != 0;
+        if (const char * max_batch_env = getenv("GGML_CUDA_TP_GRAPH_MAX_BATCH")) {
+            const long value = strtol(max_batch_env, nullptr, 10);
+            if (value > 0) {
+                capture_max_batch = (size_t) value;
+            }
+        }
+        if (const char * max_graphs_env = getenv("GGML_CUDA_TP_GRAPH_MAX_GRAPHS")) {
+            const long value = strtol(max_graphs_env, nullptr, 10);
+            if (value > 0) {
+                capture_max_graphs = (size_t) value;
+            }
+        }
+
         if (n_devs > 1) {
-            ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_init");
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+            ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_init");
             if (comm_init != nullptr) {
                 comm_ctx = comm_init(simple_backends.data(), simple_backends.size());
             }
+
+            if (capture_requested) {
+                graph_capture_compatible = (ggml_backend_graph_capture_compatible_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_capture_compatible");
+                graph_capture_begin = (ggml_backend_graph_capture_begin_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_capture_begin");
+                graph_capture_end = (ggml_backend_graph_capture_end_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_capture_end");
+                graph_capture_finalize = (ggml_backend_graph_capture_finalize_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_capture_finalize");
+                graph_capture_launch = (ggml_backend_graph_capture_launch_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_capture_launch");
+                graph_capture_free = (ggml_backend_graph_capture_free_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_capture_free");
+            }
         }
         if (comm_ctx != nullptr) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
             comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
-                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
-                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+            comm_gather = (ggml_backend_comm_gather_tensor_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_gather_tensor");
+            comm_graph_compatible = (ggml_backend_comm_graph_compatible_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_graph_compatible");
+            comm_gather_graph_compatible = (ggml_backend_comm_gather_graph_compatible_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_gather_graph_compatible");
+        }
+
+        if (capture_requested && (!comm_ctx || !comm_graph_compatible || !comm_graph_compatible(comm_ctx) ||
+                !comm_gather || !graph_capture_compatible || !graph_capture_begin || !graph_capture_end ||
+                !graph_capture_finalize || !graph_capture_launch || !graph_capture_free)) {
+            GGML_LOG_WARN("TP CUDA graph requested but the backend or communication mode is not capture-compatible; disabling\n");
+            capture_requested = false;
+        } else if (capture_requested) {
+            graph_completion_events.reserve(n_devs);
+            for (const auto & bc : backend_configs) {
+                graph_completion_events.push_back(ggml_backend_event_new(ggml_backend_get_device(bc.backend)));
+                if (graph_completion_events.back() == nullptr) {
+                    GGML_LOG_WARN("TP CUDA graph requested but backend completion events are unavailable; disabling\n");
+                    capture_requested = false;
+                    break;
+                }
+            }
+            if (capture_requested) {
+                GGML_LOG_INFO("TP CUDA graph enabled for batches up to %zu, cache limit %zu\n",
+                    capture_max_batch, capture_max_graphs);
+            }
         }
     }
 
+    void clear_captured_graphs(bool synchronize) {
+        if (synchronize) {
+            for (auto & bc : backend_configs) {
+                ggml_backend_synchronize(bc.backend);
+            }
+        }
+        if (graph_capture_free != nullptr) {
+            for (auto & item : captured_graphs) {
+                for (size_t j = 0; j < item.second.handles.size(); ++j) {
+                    graph_capture_free(backend_configs[j].backend, item.second.handles[j]);
+                }
+            }
+        }
+        captured_graphs.clear();
+    }
+
     ~ggml_backend_meta_context() {
+        clear_captured_graphs(false);
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
             GGML_ASSERT(comm_free != nullptr);
             comm_free(comm_ctx);
+        }
+        for (ggml_backend_event_t event : graph_completion_events) {
+            ggml_backend_event_free(event);
         }
         for (auto & bc : backend_configs) {
             ggml_backend_free(bc.backend);
@@ -2083,6 +2191,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
+        int64_t capture_batch = 0;
+        int n_nodes_compute = cgraph->n_nodes;
+        while (n_nodes_compute > 0) {
+            const ggml_tensor * node = cgraph->nodes[n_nodes_compute - 1];
+            if (node->view_src == nullptr || node->view_src->op != GGML_OP_NONE ||
+                    !ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                break;
+            }
+            --n_nodes_compute;
+        }
 
         std::map<const ggml_tensor *, bool> primary_only_cache;
         auto requires_primary = [&](auto && self, const ggml_tensor * tensor) -> bool {
@@ -2298,14 +2416,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
+                    capture_batch = std::max(capture_batch, ggml_nrows(node));
+                }
+                // Keep dynamic attention outside the per-subgraph CUDA graphs used by the normal Meta path.
+                // A complete TP decode graph still captures these singleton subgraphs from the outside.
+                const bool piecewise_graph_unsafe = backend_ctx->capture_requested && node->op == GGML_OP_FLASH_ATTN_EXT;
+                if (piecewise_graph_unsafe) {
+                    for (size_t j = 0; j < n_backends; ++j) {
+                        backend_ctx->backend_configs[j].nodes[i]->flags |= GGML_TENSOR_FLAG_META_CUDA_GRAPH_UNSAFE_INTERNAL;
+                    }
+                    if (i_start < i) {
+                        for (size_t j = 0; j < n_backends; ++j) {
+                            auto & bcj = backend_ctx->backend_configs[j];
+                            bcj.cgraphs[n_subgraphs].offset = i_start;
+                            bcj.cgraphs[n_subgraphs].sync_after = ggml_backend_meta_context::SYNC_NONE;
+                        }
+                        ++n_subgraphs;
+                        i_start = i;
+                    }
                 }
                 const bool gather_primary = node->flags & GGML_TENSOR_FLAG_META_GATHER;
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL || gather_primary;
+                const bool new_subgraph = piecewise_graph_unsafe || i + 1 == n_nodes_compute ||
+                    split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL || gather_primary;
                 if (!new_subgraph) {
                     continue;
                 }
 
-                const int i_delayed = gather_primary ? i : get_i_delayed(i);
+                const int i_delayed = gather_primary || piecewise_graph_unsafe ? i : get_i_delayed(i);
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
@@ -2333,11 +2470,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 n_subgraphs++;
                 i_start = i + 1;
             }
-            GGML_ASSERT(i_start == cgraph->n_nodes);
+
+            GGML_ASSERT(i_start == n_nodes_compute);
         }
 
         backend_ctx->uid         = cgraph->uid;
         backend_ctx->n_subgraphs = n_subgraphs;
+        backend_ctx->capture_batch = capture_batch;
 
         if (max_tmp_size > backend_ctx->max_tmp_size) {
             for (size_t j = 0; j < n_backends; j++) {
@@ -2383,7 +2522,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             for (size_t i_graph = 0; i_graph < n_subgraphs; i_graph++) {
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
                 const size_t i_node_start = bcj.cgraphs[i_graph].offset;
-                const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
+                const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : n_nodes_compute;
                 cgraph_ij->n_nodes = i_node_stop - i_node_start;
                 ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
                 for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
@@ -2396,6 +2535,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 cgraph_ij->uid = ggml_graph_next_uid();
             }
         }
+
+        // The scheduler may assign a fresh UID to an otherwise identical decode graph. Key captures by
+        // the actual topology and storage so stable decode shapes are reused across those short-lived UIDs.
+        uint64_t capture_key = 0xcbf29ce484222325ULL;
+        const auto mix_capture_key = [&](uint64_t value) {
+            capture_key ^= value + 0x9e3779b97f4a7c15ULL + (capture_key << 6) + (capture_key >> 2);
+        };
+        mix_capture_key((uint64_t) cgraph->n_nodes);
+        mix_capture_key((uint64_t) n_subgraphs);
+        for (size_t j = 0; j < n_backends; ++j) {
+            const auto & bcj = backend_ctx->backend_configs[j];
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * node = bcj.nodes[i];
+                mix_capture_key((uint64_t) node->op);
+                mix_capture_key((uint64_t) (uintptr_t) node->data);
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    mix_capture_key((uint64_t) node->ne[d]);
+                    mix_capture_key((uint64_t) node->nb[d]);
+                }
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    mix_capture_key((uint64_t) (uintptr_t) (node->src[s] ? node->src[s]->data : nullptr));
+                }
+                for (size_t p = 0; p < GGML_MAX_OP_PARAMS / sizeof(uint64_t); ++p) {
+                    uint64_t value;
+                    memcpy(&value, node->op_params + p * sizeof(uint64_t), sizeof(value));
+                    mix_capture_key(value);
+                }
+            }
+        }
+        backend_ctx->capture_key = capture_key;
     }
 
     size_t iga = 0; // i graph aux
@@ -2556,6 +2725,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         if (n_rows == 0) {
             return;
         }
+
+        if (backend_ctx->comm_gather != nullptr) {
+            std::vector<ggml_tensor *> sources;
+            sources.reserve(n_backends);
+            for (size_t j = 0; j < n_backends; ++j) {
+                auto & bc_src = backend_ctx->backend_configs[j];
+                ggml_cgraph * graph_src = bc_src.cgraphs[i].cgraph_main;
+                sources.push_back(graph_src->nodes[graph_src->n_nodes - 1]->src[0]);
+            }
+            if (backend_ctx->comm_gather(backend_ctx->comm_ctx, sources.data(), dst)) {
+                return;
+            }
+        }
+
+        // The generic gather copies peer shards outside the graph. Drain prior
+        // collective work first because backend-specific AllReduce kernels can
+        // have cross-device dependencies that are not represented by a CUDA
+        // event on the destination stream.
+        for (size_t j = 0; j < n_backends; ++j) {
+            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+        }
+
         int64_t offset_0 = 0;
 
         for (size_t j = 0; j < n_backends; ++j) {
@@ -2602,40 +2793,187 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
-    for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+    const bool capture_gather = backend_ctx->comm_gather_graph_compatible != nullptr &&
+        backend_ctx->comm_gather_graph_compatible(backend_ctx->comm_ctx);
+    size_t capture_subgraphs = backend_ctx->n_subgraphs;
+    bool defer_gather = false;
+    if (!capture_gather) {
+        for (size_t i = 0; i < backend_ctx->n_subgraphs; ++i) {
+            if (backend_ctx->backend_configs[0].cgraphs[i].sync_after ==
+                    ggml_backend_meta_context::SYNC_GATHER_PRIMARY) {
+                capture_subgraphs = i + 1;
+                defer_gather = true;
+                break;
             }
         }
+    }
 
-        const auto sync_after = backend_ctx->backend_configs[0].cgraphs[i].sync_after;
-        if (sync_after == ggml_backend_meta_context::SYNC_GATHER_PRIMARY) {
-            gather_primary(i);
-        } else if (sync_after == ggml_backend_meta_context::SYNC_ALLREDUCE && n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
-            bool backend_allreduce_success = false;
-            if (backend_ctx->comm_ctx) {
-                std::vector<ggml_tensor *> nodes;
-                nodes.reserve(n_backends);
-                for (size_t j = 0; j < n_backends; j++) {
-                    auto & bcj = backend_ctx->backend_configs[j];
-                    ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
-                    nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
-                }
-                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
-            }
-
-            if (!backend_allreduce_success) {
-                const ggml_status status = allreduce_fallback(i);
+    auto execute_subgraphs = [&](size_t begin, size_t end, bool during_capture = false) -> ggml_status {
+        iga = 0;
+        ina = 0;
+        for (size_t i = begin; i < end; i++) {
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
             }
+
+            const auto sync_after = backend_ctx->backend_configs[0].cgraphs[i].sync_after;
+            if (sync_after == ggml_backend_meta_context::SYNC_GATHER_PRIMARY) {
+                if (!during_capture || capture_gather) {
+                    gather_primary(i);
+                }
+            } else if (sync_after == ggml_backend_meta_context::SYNC_ALLREDUCE && n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+                bool backend_allreduce_success = false;
+                if (backend_ctx->comm_ctx) {
+                    std::vector<ggml_tensor *> nodes;
+                    nodes.reserve(n_backends);
+                    for (size_t j = 0; j < n_backends; j++) {
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                        nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
+                    }
+                    backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                }
+
+                if (!backend_allreduce_success) {
+                    const ggml_status status = allreduce_fallback(i);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                }
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    };
+
+    auto execute_deferred_gather = [&](size_t i) {
+        if (capture_gather) {
+            return;
+        }
+        // A peer shard may be consumed on the primary stream immediately after
+        // graph launch. Establish that cross-device dependency without a host
+        // synchronization; the primary graph is already ordered on its stream.
+        for (size_t j = 1; j < n_backends; ++j) {
+            ggml_backend_event_record(backend_ctx->graph_completion_events[j], backend_ctx->backend_configs[j].backend);
+            ggml_backend_event_wait(backend_ctx->backend_configs[0].backend, backend_ctx->graph_completion_events[j]);
+        }
+        GGML_ASSERT(i < backend_ctx->n_subgraphs);
+        GGML_ASSERT(backend_ctx->backend_configs[0].cgraphs[i].sync_after ==
+            ggml_backend_meta_context::SYNC_GATHER_PRIMARY);
+        gather_primary(i);
+    };
+
+    const bool capture_eligible = backend_ctx->capture_requested && capture_subgraphs > 0 &&
+        backend_ctx->capture_batch > 0 &&
+        (size_t) backend_ctx->capture_batch <= backend_ctx->capture_max_batch;
+    if (!capture_eligible) {
+        return execute_subgraphs(0, backend_ctx->n_subgraphs);
+    }
+
+    auto captured_it = backend_ctx->captured_graphs.find(backend_ctx->capture_key);
+    if (captured_it == backend_ctx->captured_graphs.end() &&
+            backend_ctx->captured_graphs.size() >= backend_ctx->capture_max_graphs) {
+        GGML_LOG_WARN("TP CUDA graph cache reached %zu unique graphs; disabling TP capture and falling back to eager execution\n",
+            backend_ctx->capture_max_graphs);
+        backend_ctx->clear_captured_graphs(true);
+        backend_ctx->capture_requested = false;
+        return execute_subgraphs(0, backend_ctx->n_subgraphs);
+    }
+    if (captured_it == backend_ctx->captured_graphs.end()) {
+        captured_it = backend_ctx->captured_graphs.emplace(
+            backend_ctx->capture_key, ggml_backend_meta_context::captured_graph {}).first;
+    }
+    auto & captured = captured_it->second;
+    if (!captured.handles.empty()) {
+        for (size_t j = 0; j < n_backends; ++j) {
+            if (!backend_ctx->graph_capture_launch(backend_ctx->backend_configs[j].backend, captured.handles[j])) {
+                return GGML_STATUS_FAILED;
+            }
+        }
+        if (defer_gather) {
+            execute_deferred_gather(capture_subgraphs - 1);
+        }
+        return execute_subgraphs(capture_subgraphs, backend_ctx->n_subgraphs);
+    }
+
+    if (captured.failed || captured.warmups < 2) {
+        const ggml_status status = execute_subgraphs(0, backend_ctx->n_subgraphs);
+        if (status == GGML_STATUS_SUCCESS && !captured.failed) {
+            ++captured.warmups;
+        }
+        return status;
+    }
+
+    for (size_t j = 0; j < n_backends; ++j) {
+        auto & bcj = backend_ctx->backend_configs[j];
+        for (size_t i = 0; i < backend_ctx->n_subgraphs; ++i) {
+            if (!backend_ctx->graph_capture_compatible(bcj.backend, bcj.cgraphs[i].cgraph_main)) {
+                captured.failed = true;
+                GGML_LOG_DEBUG("TP CUDA graph disabled for graph %" PRIu64 ": incompatible subgraph\n", cgraph->uid);
+                return execute_subgraphs(0, backend_ctx->n_subgraphs);
+            }
+        }
+        // Stream capture starts from a clean boundary once per new graph shape. Replays remain fully asynchronous.
+        ggml_backend_synchronize(bcj.backend);
+    }
+
+    size_t n_started = 0;
+    for (; n_started < n_backends; ++n_started) {
+        if (!backend_ctx->graph_capture_begin(backend_ctx->backend_configs[n_started].backend)) {
+            break;
         }
     }
-    return GGML_STATUS_SUCCESS;
+
+    if (n_started != n_backends) {
+        for (size_t j = 0; j < n_started; ++j) {
+            void * handle = backend_ctx->graph_capture_end(backend_ctx->backend_configs[j].backend);
+            backend_ctx->graph_capture_free(backend_ctx->backend_configs[j].backend, handle);
+        }
+        captured.failed = true;
+        return execute_subgraphs(0, backend_ctx->n_subgraphs);
+    }
+
+    const ggml_status capture_status = execute_subgraphs(0, capture_subgraphs, /* during_capture = */ true);
+    std::vector<void *> handles(n_backends, nullptr);
+    bool capture_ok = capture_status == GGML_STATUS_SUCCESS;
+    for (size_t j = 0; j < n_backends; ++j) {
+        handles[j] = backend_ctx->graph_capture_end(backend_ctx->backend_configs[j].backend);
+        capture_ok = capture_ok && handles[j] != nullptr;
+    }
+    if (capture_ok) {
+        for (size_t j = 0; j < n_backends; ++j) {
+            capture_ok = backend_ctx->graph_capture_finalize(backend_ctx->backend_configs[j].backend, handles[j]) && capture_ok;
+        }
+    }
+
+    if (!capture_ok) {
+        for (size_t j = 0; j < n_backends; ++j) {
+            backend_ctx->graph_capture_free(backend_ctx->backend_configs[j].backend, handles[j]);
+        }
+        if (capture_status != GGML_STATUS_SUCCESS) {
+            return capture_status;
+        }
+        GGML_LOG_WARN("TP CUDA graph instantiation failed; releasing the TP graph cache and falling back to eager execution\n");
+        backend_ctx->clear_captured_graphs(true);
+        backend_ctx->capture_requested = false;
+        return execute_subgraphs(0, backend_ctx->n_subgraphs);
+    }
+
+    captured.handles = std::move(handles);
+    GGML_LOG_INFO("captured TP CUDA graph %" PRIu64 " (%zu/%zu subgraphs, batch=%" PRId64 ")\n",
+        cgraph->uid, capture_subgraphs, backend_ctx->n_subgraphs, backend_ctx->capture_batch);
+    for (size_t j = 0; j < n_backends; ++j) {
+        if (!backend_ctx->graph_capture_launch(backend_ctx->backend_configs[j].backend, captured.handles[j])) {
+            return GGML_STATUS_FAILED;
+        }
+    }
+    if (defer_gather) {
+        execute_deferred_gather(capture_subgraphs - 1);
+    }
+    return execute_subgraphs(capture_subgraphs, backend_ctx->n_subgraphs);
 }
 
 static const ggml_backend_i ggml_backend_meta_i = {

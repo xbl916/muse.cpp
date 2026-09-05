@@ -333,6 +333,287 @@ static void test_reasoning_budget_end_match() {
     fprintf(stderr, "  Test 'matched end sequence' passed\n");
 }
 
+static void test_reasoning_budget_soft_hint_at_75_percent() {
+    const std::vector<llama_token> start = {100};
+    const std::vector<llama_token> end = {101};
+    const std::vector<llama_token> forced = {102, 101};
+    const std::vector<llama_token> soft = {200, 201};
+
+    auto * sampler = common_reasoning_budget_init(
+            nullptr, {start}, {end}, forced, 4, REASONING_BUDGET_IDLE, 0.75f, soft, 0);
+
+    llama_sampler_accept(sampler, 100);
+    llama_sampler_accept(sampler, 50);
+    llama_sampler_accept(sampler, 51);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+
+    llama_sampler_accept(sampler, 52);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_FORCING);
+    GGML_ASSERT(get_forced_token(sampler, 201) == 200);
+    llama_sampler_accept(sampler, 200);
+    GGML_ASSERT(get_forced_token(sampler, 201) == 201);
+    llama_sampler_accept(sampler, 201);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+
+    llama_sampler_accept(sampler, 53);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING);
+
+    llama_sampler_free(sampler);
+    fprintf(stderr, "  Test 'soft hint at 75 percent' passed\n");
+}
+
+static void test_reasoning_budget_soft_hint_disabled_without_ratio() {
+    const std::vector<llama_token> start = {100};
+    const std::vector<llama_token> end = {101};
+    const std::vector<llama_token> forced = {102, 101};
+
+    auto * sampler = common_reasoning_budget_init(
+            nullptr, {start}, {end}, forced, 4, REASONING_BUDGET_IDLE, -1.0f, {200}, 0);
+
+    llama_sampler_accept(sampler, 100);
+    llama_sampler_accept(sampler, 50);
+    llama_sampler_accept(sampler, 51);
+    llama_sampler_accept(sampler, 52);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+    llama_sampler_accept(sampler, 53);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING);
+
+    llama_sampler_free(sampler);
+    fprintf(stderr, "  Test 'soft hint disabled without ratio' passed\n");
+}
+
+static std::string reasoning_budget_test_piece(void * /* user_data */, llama_token token) {
+    switch (token) {
+        case 55: return "end of line.\n";
+        case 57: return "m = [\n";
+        case 58: return "The design is now complete.\n";
+        case 59: return "```js\n";
+        case 60: return "const value = 1;\n";
+        case 61: return "```\n";
+        case 62: return "\n";
+        case 63: return "Final plan\n";
+        default: return "text";
+    }
+}
+
+static void test_reasoning_budget_soft_hint_waits_for_line_boundary() {
+    const std::vector<llama_tokens> start = {{100}};
+    const std::vector<llama_tokens> end = {{101}};
+    const llama_tokens forced = {102, 101};
+    const llama_tokens soft = {200};
+
+    auto * sampler = common_reasoning_budget_init_pieces(
+            reasoning_budget_test_piece, nullptr, start, end, forced,
+            8, REASONING_BUDGET_IDLE, 0.5f, soft, 0, 3);
+
+    llama_sampler_accept(sampler, 100);
+    llama_sampler_accept(sampler, 50);
+    llama_sampler_accept(sampler, 51);
+    llama_sampler_accept(sampler, 52);
+    llama_sampler_accept(sampler, 53);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_PENDING);
+
+    llama_sampler_accept(sampler, 54);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_PENDING);
+    llama_sampler_accept(sampler, 55);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_FORCING);
+    GGML_ASSERT(get_forced_token(sampler, 201) == 200);
+
+    llama_sampler_free(sampler);
+    fprintf(stderr, "  Test 'soft hint waits for line boundary' passed\n");
+}
+
+static void test_reasoning_budget_soft_hint_boundary_wait_is_bounded() {
+    const std::vector<llama_tokens> start = {{100}};
+    const std::vector<llama_tokens> end = {{101}};
+
+    auto * sampler = common_reasoning_budget_init_pieces(
+            reasoning_budget_test_piece, nullptr, start, end, {102, 101},
+            8, REASONING_BUDGET_IDLE, 0.5f, {200}, 0, 2);
+
+    llama_sampler_accept(sampler, 100);
+    llama_sampler_accept(sampler, 50);
+    llama_sampler_accept(sampler, 51);
+    llama_sampler_accept(sampler, 52);
+    llama_sampler_accept(sampler, 53);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_PENDING);
+    llama_sampler_accept(sampler, 54);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_PENDING);
+    llama_sampler_accept(sampler, 56);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_FORCING);
+    llama_sampler_free(sampler);
+
+    sampler = common_reasoning_budget_init_pieces(
+            reasoning_budget_test_piece, nullptr, start, end, {102, 101},
+            8, REASONING_BUDGET_IDLE, 0.5f, {200}, 0, 2);
+    llama_sampler_accept(sampler, 100);
+    llama_sampler_accept(sampler, 50);
+    llama_sampler_accept(sampler, 51);
+    llama_sampler_accept(sampler, 52);
+    llama_sampler_accept(sampler, 53);
+    llama_sampler_accept(sampler, 101);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+    llama_sampler_free(sampler);
+
+    GGML_ASSERT(!common_reasoning_budget_is_line_boundary("text"));
+    GGML_ASSERT(common_reasoning_budget_is_line_boundary("text\nmore"));
+    fprintf(stderr, "  Test 'soft hint boundary wait is bounded' passed\n");
+}
+
+static void test_reasoning_budget_soft_hint_rejects_unsafe_line_end() {
+    auto * sampler = common_reasoning_budget_init_pieces(
+            reasoning_budget_test_piece, nullptr, {{100}}, {{101}}, {102, 101},
+            8, REASONING_BUDGET_IDLE, 0.5f, {200}, 0, 4);
+
+    llama_sampler_accept(sampler, 100);
+    llama_sampler_accept(sampler, 50);
+    llama_sampler_accept(sampler, 51);
+    llama_sampler_accept(sampler, 52);
+    llama_sampler_accept(sampler, 57); // "m = [\n" is a newline, but not a safe boundary
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_PENDING);
+    llama_sampler_accept(sampler, 58); // complete sentence
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_FORCING);
+
+    llama_sampler_free(sampler);
+    fprintf(stderr, "  Test 'soft hint rejects unsafe line end' passed\n");
+}
+
+static void test_reasoning_budget_soft_hint_avoids_fenced_code() {
+    auto * sampler = common_reasoning_budget_init_pieces(
+            reasoning_budget_test_piece, nullptr, {{100}}, {{101}}, {102, 101},
+            8, REASONING_BUDGET_IDLE, 0.5f, {200}, 0, 5);
+
+    llama_sampler_accept(sampler, 100);
+    llama_sampler_accept(sampler, 50);
+    llama_sampler_accept(sampler, 51);
+    llama_sampler_accept(sampler, 52);
+    llama_sampler_accept(sampler, 59); // opening fence at the threshold
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_PENDING);
+    llama_sampler_accept(sampler, 60); // sentence-like code remains unsafe inside the fence
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_PENDING);
+    llama_sampler_accept(sampler, 61); // closing fence
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_PENDING);
+    llama_sampler_accept(sampler, 62); // blank line after the closed fence
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_FORCING);
+
+    llama_sampler_free(sampler);
+    fprintf(stderr, "  Test 'soft hint avoids fenced code' passed\n");
+}
+
+static void test_reasoning_budget_soft_hint_accepts_paragraph_boundary() {
+    auto * sampler = common_reasoning_budget_init_pieces(
+            reasoning_budget_test_piece, nullptr, {{100}}, {{101}}, {102, 101},
+            8, REASONING_BUDGET_IDLE, 0.5f, {200}, 0, 3);
+
+    llama_sampler_accept(sampler, 100);
+    llama_sampler_accept(sampler, 50);
+    llama_sampler_accept(sampler, 51);
+    llama_sampler_accept(sampler, 52);
+    llama_sampler_accept(sampler, 63); // no terminal punctuation yet
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_PENDING);
+    llama_sampler_accept(sampler, 62); // blank line completes the paragraph
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_SOFT_FORCING);
+
+    llama_sampler_free(sampler);
+    fprintf(stderr, "  Test 'soft hint accepts paragraph boundary' passed\n");
+}
+
+static void test_reasoning_budget_bounded_grace_and_manual_force() {
+    const std::vector<llama_token> start = {100};
+    const std::vector<llama_token> end = {101};
+    const std::vector<llama_token> forced = {102, 101};
+
+    auto * sampler = common_reasoning_budget_init_pieces(
+            reasoning_budget_test_piece, nullptr, {start}, {end}, forced,
+            2, REASONING_BUDGET_IDLE, -1.0f, {}, 2);
+    llama_sampler_accept(sampler, 100);
+    llama_sampler_accept(sampler, 50);
+    llama_sampler_accept(sampler, 51);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_HARD_PENDING);
+
+    GGML_ASSERT(common_reasoning_budget_force(sampler));
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING);
+    GGML_ASSERT(get_forced_token(sampler, 102) == 102);
+    llama_sampler_free(sampler);
+
+    sampler = common_reasoning_budget_init_pieces(
+            reasoning_budget_test_piece, nullptr, {start}, {end}, forced,
+            2, REASONING_BUDGET_IDLE, -1.0f, {}, 2);
+    llama_sampler_accept(sampler, 100);
+    llama_sampler_accept(sampler, 50);
+    llama_sampler_accept(sampler, 51);
+    llama_sampler_accept(sampler, 52);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_HARD_PENDING);
+    llama_sampler_accept(sampler, 53);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING);
+    llama_sampler_free(sampler);
+
+    fprintf(stderr, "  Test 'bounded grace and manual force' passed\n");
+}
+
+static struct llama_sampler * make_convergence_sampler(
+        int32_t converge_tokens, float max_bias = 0.0f, int32_t bias_delay_tokens = 0) {
+    return common_reasoning_budget_init_pieces(
+            reasoning_budget_test_piece, nullptr,
+            {{100}}, {{101}}, {102, 101},
+            12, REASONING_BUDGET_IDLE, 0.5f, {},
+            2, 3, converge_tokens, max_bias, bias_delay_tokens);
+}
+
+static void test_reasoning_budget_two_stage_handoff() {
+    auto * sampler = common_reasoning_budget_init_pieces(
+            reasoning_budget_test_piece, nullptr,
+            {{100}}, {{101}}, {102, 101},
+            12, REASONING_BUDGET_IDLE, 0.5f, {200, 201},
+            2, 3, 4, 8.0f);
+
+    llama_sampler_accept(sampler, 100);
+    llama_sampler_accept(sampler, 50);
+    llama_sampler_accept(sampler, 51);
+    llama_sampler_accept(sampler, 52);
+    llama_sampler_accept(sampler, 53);
+    llama_sampler_accept(sampler, 54);
+    llama_sampler_accept(sampler, 55); // threshold at a safe boundary
+
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_HANDOFF_FORCING);
+    GGML_ASSERT(get_forced_token(sampler, 201) == 200);
+    llama_sampler_accept(sampler, 200);
+    GGML_ASSERT(get_forced_token(sampler, 201) == 201);
+    llama_sampler_accept(sampler, 201);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_HANDOFF_FORCING);
+    GGML_ASSERT(get_forced_token(sampler, 201) == 101);
+    llama_sampler_accept(sampler, 101);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+    const llama_tokens * matched = common_reasoning_budget_get_end_match(sampler);
+    GGML_ASSERT(matched != nullptr && *matched == llama_tokens({101}));
+
+    llama_sampler_free(sampler);
+    fprintf(stderr, "  Test 'deterministic two-stage handoff' passed\n");
+}
+
+static void reach_two_stage_handoff(struct llama_sampler * sampler) {
+    llama_sampler_accept(sampler, 100);
+    llama_sampler_accept(sampler, 50);
+    llama_sampler_accept(sampler, 51);
+    llama_sampler_accept(sampler, 52);
+    llama_sampler_accept(sampler, 53);
+    llama_sampler_accept(sampler, 54);
+    llama_sampler_accept(sampler, 55); // threshold reached at a line boundary
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_HANDOFF_FORCING);
+}
+
+static void test_reasoning_budget_empty_transition_closes_immediately() {
+    auto * sampler = make_convergence_sampler(3);
+    reach_two_stage_handoff(sampler);
+
+    GGML_ASSERT(get_forced_token(sampler, 102) == 101);
+    llama_sampler_accept(sampler, 101);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+
+    llama_sampler_free(sampler);
+    fprintf(stderr, "  Test 'empty transition closes reasoning immediately' passed\n");
+}
+
 // UTF-8 boundary detection unit test
 // Tests common_utf8_is_complete() from reasoning-budget.h
 static void test_utf8_boundary_detection() {
@@ -494,8 +775,18 @@ int main(void) {
     test_reasoning_budget_clone_mid_forcing();
     test_reasoning_budget_force_manual();
     test_reasoning_budget_end_match();
+    test_reasoning_budget_soft_hint_at_75_percent();
+    test_reasoning_budget_soft_hint_disabled_without_ratio();
+    test_reasoning_budget_soft_hint_waits_for_line_boundary();
+    test_reasoning_budget_soft_hint_boundary_wait_is_bounded();
+    test_reasoning_budget_soft_hint_rejects_unsafe_line_end();
+    test_reasoning_budget_soft_hint_avoids_fenced_code();
+    test_reasoning_budget_soft_hint_accepts_paragraph_boundary();
+    test_reasoning_budget_bounded_grace_and_manual_force();
+    test_reasoning_budget_two_stage_handoff();
+    test_reasoning_budget_empty_transition_closes_immediately();
 
-    printf("OK (12 tests passed)\n");
+    printf("OK (22 tests passed)\n");
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();

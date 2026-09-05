@@ -66,6 +66,12 @@ static __device__ __forceinline__ half2 ggml_cuda_movmatrix(const half2 x) {
     return ret;
 }
 
+static __device__ __forceinline__ nv_bfloat162 ggml_cuda_movmatrix(const nv_bfloat162 x) {
+    nv_bfloat162 ret;
+    *((int *) &ret) = ggml_cuda_movmatrix(*((const int *) &x));
+    return ret;
+}
+
 namespace ggml_cuda_mma {
 
     // Some architectures like Volta or CDNA3 perform multiple matrix multiplications per warp in parallel,
@@ -726,6 +732,25 @@ namespace ggml_cuda_mma {
 
         return ret;
     }
+
+    template <int I, int J>
+    static __device__ __forceinline__ tile<I, J/2, nv_bfloat162> get_bfloat162(const tile<I, J, float> & tile_float) {
+        tile<I, J/2, nv_bfloat162> ret;
+#pragma unroll
+        for (int l0 = 0; l0 < tile_float.ne; l0 += 2) {
+            ret.x[l0/2] = {tile_float.x[l0 + 0], tile_float.x[l0 + 1]};
+        }
+        return ret;
+    }
+
+    static __device__ __forceinline__ tile<8, 8, nv_bfloat162> get_transposed(
+            const tile<16, 4, nv_bfloat162> & t) {
+        tile<8, 8, nv_bfloat162> ret;
+        ret.x[0] = ggml_cuda_movmatrix(t.x[0]);
+        ret.x[1] = ggml_cuda_movmatrix(t.x[1]);
+
+        return ret;
+    }
 #elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
     static __device__ __forceinline__ tile<16, 8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED> get_half2(
             const tile<16, 16, float, DATA_LAYOUT_I_MAJOR> & tile_float) {
@@ -1257,7 +1282,17 @@ namespace ggml_cuda_mma {
     template <data_layout dl_ab, data_layout dl_d>
     static __device__ __forceinline__ void mma(
             tile<16, 16, float, dl_d> & D, const tile<16, 8, nv_bfloat162, dl_ab> & A, const tile<16, 8, nv_bfloat162, dl_ab> & B) {
-#if defined(AMD_WMMA_AVAILABLE)
+#if defined(AMPERE_MMA_AVAILABLE)
+        const int * Axi = (const int *) A.x;
+        const int * Bxi = (const int *) B.x;
+        int       * Dxi = (int       *) D.x;
+        asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+            : "+r"(Dxi[0]), "+r"(Dxi[1]), "+r"(Dxi[2]), "+r"(Dxi[3])
+            : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[0]), "r"(Bxi[2]));
+        asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+            : "+r"(Dxi[4]), "+r"(Dxi[5]), "+r"(Dxi[6]), "+r"(Dxi[7])
+            : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]), "r"(Bxi[1]), "r"(Bxi[3]));
+#elif defined(AMD_WMMA_AVAILABLE)
 #if defined(RDNA4)
         using bf16x8_t = __attribute__((ext_vector_type(8))) __bf16;
         using floatx8_t = __attribute__((ext_vector_type(8))) float;
@@ -1299,7 +1334,7 @@ namespace ggml_cuda_mma {
 #else
         GGML_UNUSED_VARS(D, A, B);
         NO_DEVICE_CODE;
-#endif // defined(AMD_WMMA_AVAILABLE)
+#endif // defined(AMPERE_MMA_AVAILABLE)
     }
 
     template <data_layout dl_d, data_layout dl_ab>

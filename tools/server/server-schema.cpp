@@ -384,6 +384,84 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Number of tokens in the reasoning budget (-1 = disabled)"));
 
+    add((new field_num("reasoning_converge_ratio", params.sampling.reasoning_converge_ratio))
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const float value = data.at("reasoning_converge_ratio").get<float>();
+            if (value != -1.0f && (value <= 0.0f || value >= 1.0f)) {
+                throw std::invalid_argument("value must be -1 or satisfy 0 < value < 1");
+            }
+            ctx.params.sampling.reasoning_converge_ratio = value;
+        })
+        ->set_desc("Fraction of the reasoning budget at which to lock the plan and begin convergence (-1 = disabled)"));
+
+    add((new field_num("reasoning_converge_tokens", params.sampling.reasoning_converge_tokens))
+        ->set_hard_limits(-1, INT32_MAX)
+        ->set_desc("Non-negative enables deterministic two-stage handoff (-1 = disabled); value retained for compatibility"));
+
+    add((new field_str("reasoning_converge_marker"))
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.sampling.reasoning_converge_marker = data.at("reasoning_converge_marker").get<std::string>();
+        })
+        ->set_desc("Optional marker prefixed to the one-shot reasoning handoff prefix"));
+
+    add((new field_str("reasoning_converge_message"))
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.sampling.reasoning_converge_message = data.at("reasoning_converge_message").get<std::string>();
+        })
+        ->set_desc("Transition sentence forced before the native reasoning end tag"));
+
+    add((new field_str("reasoning_handoff_prefix"))
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.sampling.reasoning_converge_message = data.at("reasoning_handoff_prefix").get<std::string>();
+        })
+        ->set_desc("Alias for reasoning_converge_message"));
+
+    add((new field_str("reasoning_handoff_transition"))
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.sampling.reasoning_converge_message = data.at("reasoning_handoff_transition").get<std::string>();
+        })
+        ->set_desc("Alias for reasoning_converge_message"));
+
+    add((new field_num("reasoning_converge_boundary_tokens", params.sampling.reasoning_converge_boundary_tokens))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Maximum tokens to wait for a safe text boundary before the two-stage handoff"));
+
+    add((new field_num("reasoning_handoff_bias_delay_tokens", params.sampling.reasoning_converge_bias_delay_tokens))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Compatibility option ignored by deterministic two-stage handoff"));
+
+    add((new field_num("reasoning_converge_max_bias", params.sampling.reasoning_converge_max_bias))
+        ->set_hard_limits(0.0, INFINITY)
+        ->set_desc("Compatibility option ignored by deterministic two-stage handoff"));
+
+    add((new field_num("reasoning_hard_boundary_tokens", params.sampling.reasoning_hard_boundary_tokens))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Maximum tokens to wait for a line boundary before forcing the reasoning end tag"));
+
+    add((new field_num("reasoning_budget_soft_ratio", params.sampling.reasoning_budget_soft_ratio))
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const float value = data.at("reasoning_budget_soft_ratio").get<float>();
+            if (value != -1.0f && (value <= 0.0f || value >= 1.0f)) {
+                throw std::invalid_argument("value must be -1 or satisfy 0 < value < 1");
+            }
+            ctx.params.sampling.reasoning_budget_soft_ratio = value;
+        })
+        ->set_desc("Fraction of the reasoning budget at which to inject a one-time wrap-up hint (-1 = disabled)"));
+
+    add((new field_str("reasoning_budget_soft_message"))
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.sampling.reasoning_budget_soft_message = data.at("reasoning_budget_soft_message").get<std::string>();
+        })
+        ->set_desc("One-time wrap-up hint injected at the soft reasoning-budget threshold"));
+
+    add((new field_num("reasoning_budget_soft_boundary_tokens", params.sampling.reasoning_budget_soft_boundary_tokens))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Maximum tokens to wait for a safe text boundary before injecting the soft reasoning-budget hint"));
+
+    add((new field_num("reasoning_budget_grace_tokens", params.sampling.reasoning_budget_grace_tokens))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Extra reasoning tokens allowed after the budget before forcing the end tag"));
+
     add((new field_str("reasoning_budget_start_tag"))
         ->set_desc("Token string marking the start of the reasoning budget section")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
@@ -556,11 +634,17 @@ task_params eval_llama_cmpl_schema(
     // debugging
     {
         auto budget = params.sampling.reasoning_budget_tokens;
-        SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu seqs, forced=%zu toks\n",
+        SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu seqs, forced=%zu toks, converge_ratio=%.2f, converge_tokens=%d, converge_boundary=%d, handoff_bias_delay=%d, converge_max_bias=%.2f, hard_boundary=%d\n",
                 budget, params.sampling.generation_prompt.c_str(),
                 params.sampling.reasoning_budget_start.size(),
                 params.sampling.reasoning_budget_end.size(),
-                params.sampling.reasoning_budget_forced.size());
+                params.sampling.reasoning_budget_forced.size(),
+                params.sampling.reasoning_converge_ratio,
+                params.sampling.reasoning_converge_tokens,
+                params.sampling.reasoning_converge_boundary_tokens,
+                params.sampling.reasoning_converge_bias_delay_tokens,
+                params.sampling.reasoning_converge_max_bias,
+                params.sampling.reasoning_hard_boundary_tokens);
     }
 
     return params;

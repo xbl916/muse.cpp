@@ -17,6 +17,7 @@
 #include <ctime>
 #include <numeric>
 #include <random>
+#include <unordered_set>
 #include <unordered_map>
 #include <stdexcept>
 
@@ -580,11 +581,28 @@ struct llama_sampler_backend_probe {
     ggml_cgraph * gf;
 };
 
+// Some backend samplers are inactive until request-specific inputs become
+// available. They must still expose their worst-case graph during probing so
+// that the shared sampling graph reserves enough nodes before activation.
+static thread_local bool llama_sampler_backend_is_probing = false;
+
+struct llama_sampler_backend_probe_scope {
+    llama_sampler_backend_probe_scope() {
+        GGML_ASSERT(!llama_sampler_backend_is_probing);
+        llama_sampler_backend_is_probing = true;
+    }
+
+    ~llama_sampler_backend_probe_scope() {
+        llama_sampler_backend_is_probing = false;
+    }
+};
+
 static llama_sampler_backend_probe llama_sampler_backend_probe_graph(
         llama_sampler * sampler,
         int64_t         n_candidates,
         uint32_t        max_nodes,
-        bool            with_candidates) {
+        bool            with_candidates,
+        bool            with_probs_and_sampled = false) {
     ggml_init_params params = {
         /*.mem_size   =*/ max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, false),
         /*.mem_buffer =*/ nullptr,
@@ -601,10 +619,12 @@ static llama_sampler_backend_probe llama_sampler_backend_probe_graph(
 
     llama_sampler_data data = {
         /*.logits       =*/ ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_candidates),
-        /*.probs        =*/ nullptr,
-        /*.sampled      =*/ nullptr,
+        /*.probs        =*/ with_probs_and_sampled ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_candidates) : nullptr,
+        /*.sampled      =*/ with_probs_and_sampled ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1) : nullptr,
         /*.candidates   =*/ with_candidates ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_candidates) : nullptr,
     };
+
+    llama_sampler_backend_probe_scope probe_scope;
 
     if (sampler->iface->backend_reset) {
         sampler->iface->backend_reset(sampler);
@@ -1414,6 +1434,380 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
     );
 }
 
+// speculative rejection
+
+struct llama_sampler_speculative_rejection : public llama_sampler_backend {
+    struct proposal {
+        bool active = false;
+        llama_token token = 0;
+        float q_selected = 0.0f;
+        std::vector<llama_token> ids;
+        std::vector<float> probs;
+    };
+
+    struct graph_inputs {
+        ggml_tensor * active;
+        ggml_tensor * draft_token;
+        ggml_tensor * q_selected;
+        ggml_tensor * q_ids;
+        ggml_tensor * q_probs;
+        ggml_tensor * uniform_accept;
+        ggml_tensor * uniform_residual;
+    };
+
+    llama_sampler_speculative_rejection(int32_t n_vocab, int32_t max_q, uint32_t seed)
+        : llama_sampler_backend("speculative-rejection"),
+          n_vocab(n_vocab), max_q(max_q), seed(seed), seed_cur(get_rng_seed(seed)),
+          rng(seed_cur), rng_backend(rng) {}
+
+    void copy_state(const llama_sampler_speculative_rejection & src) {
+        proposals = src.proposals;
+        seed_cur = src.seed_cur;
+        rng = src.rng;
+        rng_backend = src.rng_backend;
+        n_backend_draws_generated = src.n_backend_draws_generated;
+        n_backend_draws_committed = src.n_backend_draws_committed;
+    }
+
+    int32_t n_vocab;
+    int32_t max_q;
+    uint32_t seed;
+    uint32_t seed_cur;
+    std::mt19937 rng;
+    std::mt19937 rng_backend;
+    size_t n_backend_draws_generated = 0;
+    size_t n_backend_draws_committed = 0;
+    std::vector<proposal> proposals;
+    std::vector<graph_inputs> inputs;
+};
+
+static void llama_sampler_chain_set_speculative_penalties(
+        llama_sampler * chain, const llama_token * draft, int32_t n_draft);
+
+static const char * llama_sampler_speculative_rejection_name(const llama_sampler * smpl) {
+    return ((llama_sampler_speculative_rejection *) smpl->ctx)->get_name();
+}
+
+static void llama_sampler_speculative_rejection_accept(llama_sampler * smpl, llama_token token) {
+    GGML_UNUSED(token);
+    auto * sctx = (llama_sampler_speculative_rejection *) smpl->ctx;
+    if (sctx->n_backend_draws_committed + 2 > sctx->n_backend_draws_generated) {
+        return;
+    }
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    dist(sctx->rng);
+    dist(sctx->rng);
+    sctx->n_backend_draws_committed += 2;
+}
+
+static void llama_sampler_speculative_rejection_apply(
+        llama_sampler * smpl, llama_token_data_array * cur_p) {
+    GGML_UNUSED(smpl);
+    GGML_UNUSED(cur_p);
+}
+
+static void llama_sampler_speculative_rejection_reset(llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_speculative_rejection *) smpl->ctx;
+    sctx->proposals.clear();
+    sctx->seed_cur = get_rng_seed(sctx->seed);
+    sctx->rng.seed(sctx->seed_cur);
+    sctx->rng_backend = sctx->rng;
+    sctx->n_backend_draws_generated = 0;
+    sctx->n_backend_draws_committed = 0;
+}
+
+static llama_sampler * llama_sampler_speculative_rejection_clone(const llama_sampler * smpl) {
+    const auto * src = (const llama_sampler_speculative_rejection *) smpl->ctx;
+    auto * result = llama_sampler_init_speculative_rejection(src->n_vocab, src->max_q, src->seed);
+    ((llama_sampler_speculative_rejection *) result->ctx)->copy_state(*src);
+    return result;
+}
+
+static void llama_sampler_speculative_rejection_free(llama_sampler * smpl) {
+    delete (llama_sampler_speculative_rejection *) smpl->ctx;
+}
+
+static void llama_sampler_speculative_rejection_backend_apply(
+        llama_sampler * smpl,
+        ggml_context * ctx,
+        ggml_cgraph * gf,
+        llama_sampler_data * data) {
+    GGML_UNUSED(gf);
+    auto * sctx = (llama_sampler_speculative_rejection *) smpl->ctx;
+
+    if (sctx->proposals.empty() && !llama_sampler_backend_is_probing) {
+        return;
+    }
+
+    GGML_ASSERT(data->probs != nullptr);
+    GGML_ASSERT(data->sampled != nullptr);
+
+    llama_sampler_speculative_rejection::graph_inputs in = {
+        /* .active      = */ ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1),
+        /* .draft_token = */ ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1),
+        /* .q_selected  = */ ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1),
+        /* .q_ids       = */ ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->max_q),
+        /* .q_probs     = */ ggml_new_tensor_1d(ctx, GGML_TYPE_F32, sctx->max_q),
+        /* .uniform_accept   = */ ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1),
+        /* .uniform_residual = */ ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1),
+    };
+    for (auto * input : { in.active, in.draft_token, in.q_selected, in.q_ids, in.q_probs,
+            in.uniform_accept, in.uniform_residual }) {
+        ggml_set_input(input);
+    }
+    ggml_format_name(in.active, "spec_reject_active_%zu", sctx->inputs.size());
+    ggml_format_name(in.draft_token, "spec_reject_token_%zu", sctx->inputs.size());
+    ggml_format_name(in.q_selected, "spec_reject_q_selected_%zu", sctx->inputs.size());
+    ggml_format_name(in.q_ids, "spec_reject_q_ids_%zu", sctx->inputs.size());
+    ggml_format_name(in.q_probs, "spec_reject_q_probs_%zu", sctx->inputs.size());
+    ggml_format_name(in.uniform_accept, "spec_reject_uniform_accept_%zu", sctx->inputs.size());
+    ggml_format_name(in.uniform_residual, "spec_reject_uniform_residual_%zu", sctx->inputs.size());
+    sctx->inputs.push_back(in);
+
+    ggml_tensor * target_probs = ggml_reshape_1d(ctx, data->probs, ggml_nelements(data->probs));
+
+    ggml_tensor * q_target;
+    ggml_tensor * p_draft;
+    ggml_tensor * candidates = nullptr;
+    ggml_tensor * token_ids_f;
+    int64_t n_candidates;
+    if (data->candidates != nullptr) {
+        candidates = ggml_reshape_1d(ctx, data->candidates, ggml_nelements(data->candidates));
+        n_candidates = ggml_nelements(candidates);
+        token_ids_f = ggml_cast(ctx, candidates, GGML_TYPE_F32);
+    } else {
+        GGML_ASSERT(ggml_nelements(target_probs) == sctx->n_vocab);
+        n_candidates = sctx->n_vocab;
+        token_ids_f = ggml_arange(ctx, 0.0f, (float) sctx->n_vocab, 1.0f);
+    }
+
+    // Match sparse draft probabilities directly against target token ids.
+    // Avoid vocab-sized scatter by global token id: under tensor parallelism
+    // those ids are not valid row indices in each local vocabulary shard.
+    ggml_tensor * match_shape = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, sctx->max_q, n_candidates);
+    ggml_tensor * q_ids_f = ggml_cast(
+            ctx, ggml_reshape_2d(ctx, in.q_ids, sctx->max_q, 1), GGML_TYPE_F32);
+    q_ids_f = ggml_repeat(ctx, q_ids_f, match_shape);
+    ggml_tensor * token_ids_matrix = ggml_repeat(
+            ctx, ggml_reshape_2d(ctx, token_ids_f, 1, n_candidates), match_shape);
+    ggml_tensor * q_match = ggml_step(
+            ctx, ggml_scale_bias(ctx, ggml_abs(ctx, ggml_sub(ctx, q_ids_f, token_ids_matrix)), -1.0f, 0.5f));
+    ggml_tensor * q_probs = ggml_repeat(
+            ctx, ggml_reshape_2d(ctx, in.q_probs, sctx->max_q, 1), match_shape);
+    q_target = ggml_reshape_1d(
+            ctx, ggml_sum_rows(ctx, ggml_mul(ctx, q_match, q_probs)), n_candidates);
+
+    ggml_tensor * draft_delta = ggml_abs(ctx, ggml_sub(
+            ctx, token_ids_f, ggml_cast(ctx, in.draft_token, GGML_TYPE_F32)));
+    ggml_tensor * draft_match = ggml_step(
+            ctx, ggml_scale_bias(ctx, draft_delta, -1.0f, 0.5f));
+    p_draft = ggml_sum(ctx, ggml_mul(ctx, target_probs, draft_match));
+
+    ggml_tensor * q_safe = ggml_clamp(ctx, in.q_selected, 1e-20f, 1.0f);
+    ggml_tensor * q_present = ggml_step(ctx, in.q_selected);
+    ggml_tensor * accept_ratio = ggml_clamp(ctx, ggml_div(ctx, p_draft, q_safe), 0.0f, 1.0f);
+    accept_ratio = ggml_mul(ctx, accept_ratio, q_present);
+
+    ggml_tensor * residual = ggml_clamp(ctx, ggml_sub(ctx, target_probs, q_target), 0.0f, 1.0f);
+    ggml_tensor * residual_sum = ggml_sum(ctx, residual);
+    ggml_tensor * has_residual = ggml_step(ctx, ggml_scale_bias(ctx, residual_sum, 1.0f, -1e-12f));
+    ggml_tensor * one = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), 1.0f);
+    ggml_tensor * residual_norm = ggml_div(
+            ctx, residual, ggml_clamp(ctx, residual_sum, 1e-20f, 1.0f));
+    ggml_tensor * corrected_probs = ggml_add(
+            ctx,
+            ggml_mul(ctx, residual_norm, has_residual),
+            ggml_mul(ctx, target_probs, ggml_sub(ctx, one, has_residual)));
+    ggml_tensor * residual_cumsum = ggml_cumsum(ctx, corrected_probs);
+    ggml_tensor * residual_mask = ggml_step(ctx, ggml_sub(ctx, residual_cumsum, in.uniform_residual));
+    ggml_tensor * residual_idx_f = ggml_sum(ctx, residual_mask);
+    residual_idx_f = ggml_clamp(ctx, residual_idx_f, 1.0f, n_candidates);
+    ggml_tensor * residual_idx = ggml_cast(
+            ctx, ggml_scale_bias(ctx, residual_idx_f, -1.0f, n_candidates), GGML_TYPE_I32);
+
+    ggml_tensor * residual_token = residual_idx;
+    if (candidates != nullptr) {
+        residual_token = ggml_get_rows(
+                ctx, ggml_reshape_2d(ctx, candidates, 1, n_candidates), residual_idx);
+    }
+
+    ggml_tensor * accepted = ggml_step(ctx, ggml_sub(ctx, accept_ratio, in.uniform_accept));
+    accepted = ggml_mul(ctx, accepted, in.active);
+    ggml_tensor * draft_f = ggml_cast(ctx, in.draft_token, GGML_TYPE_F32);
+    ggml_tensor * residual_f = ggml_cast(ctx, residual_token, GGML_TYPE_F32);
+    ggml_tensor * proposal_f = ggml_add(
+            ctx,
+            ggml_mul(ctx, draft_f, accepted),
+            ggml_mul(ctx, residual_f, ggml_sub(ctx, one, accepted)));
+    ggml_tensor * original_f = ggml_cast(ctx, data->sampled, GGML_TYPE_F32);
+    ggml_tensor * final_f = ggml_add(
+            ctx,
+            ggml_mul(ctx, proposal_f, in.active),
+            ggml_mul(ctx, original_f, ggml_sub(ctx, one, in.active)));
+
+    data->sampled = ggml_cast(ctx, final_f, GGML_TYPE_I32);
+    ggml_set_name(data->sampled, "spec_reject_sampled");
+}
+
+static bool llama_sampler_speculative_rejection_backend_init(
+        llama_sampler * smpl, ggml_backend_buffer_type_t buft, uint32_t n_outputs_max_per_seq) {
+    GGML_UNUSED(n_outputs_max_per_seq);
+    auto * sctx = (llama_sampler_speculative_rejection *) smpl->ctx;
+    auto probe = llama_sampler_backend_probe_graph(
+            smpl, sctx->n_vocab, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    auto * device = ggml_backend_buft_get_device(buft);
+    bool supported = true;
+    if (device) {
+        for (int i = 0; i < ggml_graph_n_nodes(probe.gf); ++i) {
+            ggml_tensor * op = ggml_graph_node(probe.gf, i);
+            if (!ggml_backend_dev_supports_op(device, op)) {
+                LLAMA_LOG_WARN("%s: device '%s' does not support op %s needed for sampler '%s'\n",
+                        __func__, ggml_backend_dev_name(device), ggml_op_name(op->op), smpl->iface->name(smpl));
+                supported = false;
+                break;
+            }
+        }
+    }
+    sctx->init(supported);
+    sctx->rng_backend = sctx->rng;
+    sctx->n_backend_draws_generated = 0;
+    sctx->n_backend_draws_committed = 0;
+    return supported;
+}
+
+static void llama_sampler_speculative_rejection_backend_set_input(llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_speculative_rejection *) smpl->ctx;
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+    for (size_t row = 0; row < sctx->inputs.size(); ++row) {
+        const auto & in = sctx->inputs[row];
+        const bool active = row < sctx->proposals.size() && sctx->proposals[row].active;
+        const auto * proposal = active ? &sctx->proposals[row] : nullptr;
+
+        const float active_f = active ? 1.0f : 0.0f;
+        const llama_token token = active ? proposal->token : 0;
+        const float q_selected = active ? proposal->q_selected : 1.0f;
+        const float uniform_accept = dist(sctx->rng_backend);
+        const float uniform_residual = dist(sctx->rng_backend);
+        sctx->n_backend_draws_generated += 2;
+
+        std::vector<llama_token> ids(sctx->max_q, 0);
+        std::vector<float> probs(sctx->max_q, 0.0f);
+        std::unordered_set<llama_token> used_ids;
+        if (active) {
+            const size_t n = std::min<size_t>(sctx->max_q, proposal->ids.size());
+            std::copy_n(proposal->ids.begin(), n, ids.begin());
+            std::copy_n(proposal->probs.begin(), n, probs.begin());
+            used_ids.insert(proposal->ids.begin(), proposal->ids.begin() + n);
+        }
+
+        llama_token filler = 0;
+        for (int32_t i = active ? std::min<int32_t>(sctx->max_q, proposal->ids.size()) : 0;
+                i < sctx->max_q; ++i) {
+            while (used_ids.count(filler) != 0) {
+                ++filler;
+            }
+            GGML_ASSERT(filler < sctx->n_vocab);
+            ids[i] = filler;
+            used_ids.insert(filler++);
+        }
+
+        ggml_backend_tensor_set(in.active, &active_f, 0, sizeof(active_f));
+        ggml_backend_tensor_set(in.draft_token, &token, 0, sizeof(token));
+        ggml_backend_tensor_set(in.q_selected, &q_selected, 0, sizeof(q_selected));
+        ggml_backend_tensor_set(in.q_ids, ids.data(), 0, ids.size() * sizeof(ids[0]));
+        ggml_backend_tensor_set(in.q_probs, probs.data(), 0, probs.size() * sizeof(probs[0]));
+        ggml_backend_tensor_set(in.uniform_accept, &uniform_accept, 0, sizeof(uniform_accept));
+        ggml_backend_tensor_set(in.uniform_residual, &uniform_residual, 0, sizeof(uniform_residual));
+    }
+}
+
+static void llama_sampler_speculative_rejection_backend_reset(llama_sampler * smpl) {
+    ((llama_sampler_speculative_rejection *) smpl->ctx)->inputs.clear();
+}
+
+static llama_sampler_i llama_sampler_speculative_rejection_i = {
+    /* .name              = */ llama_sampler_speculative_rejection_name,
+    /* .accept            = */ llama_sampler_speculative_rejection_accept,
+    /* .apply             = */ llama_sampler_speculative_rejection_apply,
+    /* .reset             = */ llama_sampler_speculative_rejection_reset,
+    /* .clone             = */ llama_sampler_speculative_rejection_clone,
+    /* .free              = */ llama_sampler_speculative_rejection_free,
+    /* .backend_init      = */ llama_sampler_speculative_rejection_backend_init,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_speculative_rejection_backend_apply,
+    /* .backend_set_input = */ llama_sampler_speculative_rejection_backend_set_input,
+    /* .backend_reset     = */ llama_sampler_speculative_rejection_backend_reset,
+    /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_speculative_rejection>,
+};
+
+llama_sampler * llama_sampler_init_speculative_rejection(
+        int32_t n_vocab, int32_t max_q, uint32_t seed) {
+    GGML_ASSERT(n_vocab > 0);
+    GGML_ASSERT(max_q > 0);
+    return llama_sampler_init(
+        &llama_sampler_speculative_rejection_i,
+        new llama_sampler_speculative_rejection(n_vocab, max_q, seed));
+}
+
+static llama_sampler_speculative_rejection * llama_sampler_find_speculative_rejection(
+        const llama_sampler * chain) {
+    if (chain == nullptr || chain->iface != &llama_sampler_chain_i) {
+        return nullptr;
+    }
+    const auto * cctx = (const llama_sampler_chain *) chain->ctx;
+    for (const auto & entry : cctx->samplers) {
+        if (entry.ptr->iface == &llama_sampler_speculative_rejection_i) {
+            return (llama_sampler_speculative_rejection *) entry.ptr->ctx;
+        }
+    }
+    return nullptr;
+}
+
+bool llama_sampler_speculative_rejection_set(
+        llama_sampler * chain,
+        int32_t n_draft,
+        const llama_token * draft,
+        const int32_t * q_counts,
+        const llama_token * q_ids,
+        const float * q_probs,
+        int32_t q_stride) {
+    auto * sctx = llama_sampler_find_speculative_rejection(chain);
+    if (sctx == nullptr || n_draft < 0 || q_stride <= 0 ||
+            (n_draft > 0 && (!draft || !q_counts || !q_ids || !q_probs))) {
+        return false;
+    }
+
+    const bool was_empty = sctx->proposals.empty();
+    sctx->proposals.clear();
+    sctx->proposals.reserve(n_draft);
+    for (int32_t i = 0; i < n_draft; ++i) {
+        llama_sampler_speculative_rejection::proposal proposal;
+        proposal.active = true;
+        proposal.token = draft[i];
+        const int32_t n = std::min({sctx->max_q, q_counts[i], q_stride});
+        proposal.ids.reserve(n);
+        proposal.probs.reserve(n);
+        for (int32_t k = 0; k < n; ++k) {
+            const size_t off = (size_t) i * q_stride + k;
+            proposal.ids.push_back(q_ids[off]);
+            proposal.probs.push_back(q_probs[off]);
+            if (q_ids[off] == draft[i]) {
+                proposal.q_selected = q_probs[off];
+            }
+        }
+        sctx->proposals.push_back(std::move(proposal));
+    }
+    llama_sampler_chain_set_speculative_penalties(chain, draft, n_draft);
+    return was_empty && n_draft > 0;
+}
+
+bool llama_sampler_speculative_rejection_backend_enabled(const llama_sampler * chain) {
+    auto * sctx = llama_sampler_find_speculative_rejection(chain);
+    return sctx != nullptr && sctx->get_name()[0] == '+';
+}
+
 void llama_sampler_backend_begin(llama_sampler * sampler) {
     GGML_ASSERT(sampler != nullptr);
 
@@ -1432,6 +1826,11 @@ void llama_sampler_backend_begin(llama_sampler * sampler) {
             ctx->n_backend_draws_generated = 0;
             ctx->n_backend_draws_committed = 0;
         }
+    } else if (sampler->iface == &llama_sampler_speculative_rejection_i) {
+        auto * ctx = (llama_sampler_speculative_rejection *) sampler->ctx;
+        ctx->rng_backend = ctx->rng;
+        ctx->n_backend_draws_generated = 0;
+        ctx->n_backend_draws_committed = 0;
     }
 }
 
@@ -2866,9 +3265,13 @@ struct llama_sampler_penalties : public llama_sampler_backend {
     // a frequency map to count token occurrences
     std::unordered_map<llama_token, int> token_count;
 
-    // backend graph inputs
-    ggml_tensor * inp_token_ids = nullptr;
-    ggml_tensor * inp_counts    = nullptr;
+    struct graph_inputs {
+        ggml_tensor * token_ids;
+        ggml_tensor * counts;
+    };
+
+    // backend graph inputs, one pair per output row
+    std::vector<graph_inputs> inputs;
 
     // backend helpers
     int32_t n_max   = 0;
@@ -2876,11 +3279,13 @@ struct llama_sampler_penalties : public llama_sampler_backend {
 
     std::vector<int32_t> host_token_ids;
     std::vector<int32_t> host_counts;
+    std::vector<llama_token> speculative_draft;
 
     void copy_state(const llama_sampler_penalties & src) {
         // note: inp_token_ids/inp_counts belong to the current sampling graph
         prev        = src.prev;
         token_count = src.token_count;
+        speculative_draft = src.speculative_draft;
     }
 
     static bool is_disabled(
@@ -2998,6 +3403,7 @@ static void llama_sampler_penalties_reset(struct llama_sampler * smpl) {
     auto * ctx = (llama_sampler_penalties *) smpl->ctx;
     ctx->prev.clear();
     ctx->token_count.clear();
+    ctx->speculative_draft.clear();
 }
 
 static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_sampler * smpl) {
@@ -3030,10 +3436,7 @@ static bool llama_sampler_penalties_backend_init(
         uint32_t                     n_outputs_max_per_seq) {
     auto * sctx = (llama_sampler_penalties *) smpl->ctx;
 
-    if (n_outputs_max_per_seq > 1) {
-        sctx->init(false);
-        return false;
-    }
+    GGML_UNUSED(n_outputs_max_per_seq);
 
     const bool res = llama_sampler_backend_support(smpl, buft);
 
@@ -3060,13 +3463,15 @@ static void llama_sampler_penalties_backend_apply(
     sctx->has_candidates = data->candidates != nullptr;
     sctx->n_max   = std::min(sctx->penalty_last_n, sctx->n_vocab);
 
-    sctx->inp_token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
-    ggml_set_name(sctx->inp_token_ids, "penalties_token_ids");
-    ggml_set_input(sctx->inp_token_ids);
-
-    sctx->inp_counts = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max);
-    ggml_set_name(sctx->inp_counts, "penalties_counts");
-    ggml_set_input(sctx->inp_counts);
+    llama_sampler_penalties::graph_inputs in = {
+        /* .token_ids = */ ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max),
+        /* .counts    = */ ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sctx->n_max),
+    };
+    ggml_format_name(in.token_ids, "penalties_token_ids_%zu", sctx->inputs.size());
+    ggml_format_name(in.counts, "penalties_counts_%zu", sctx->inputs.size());
+    ggml_set_input(in.token_ids);
+    ggml_set_input(in.counts);
+    sctx->inputs.push_back(in);
 
     if ((int32_t) sctx->host_token_ids.size() != sctx->n_max) {
         sctx->host_token_ids.assign(sctx->n_max, 0);
@@ -3076,7 +3481,7 @@ static void llama_sampler_penalties_backend_apply(
     // flatten
     ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
     ggml_tensor * gathered = logits;
-    ggml_tensor * counts_f32 = ggml_cast(ctx, sctx->inp_counts, GGML_TYPE_F32);
+    ggml_tensor * counts_f32 = ggml_cast(ctx, in.counts, GGML_TYPE_F32);
 
     if (sctx->has_candidates) {
         ggml_tensor * candidates = ggml_reshape_1d(
@@ -3087,12 +3492,12 @@ static void llama_sampler_penalties_backend_apply(
         ggml_tensor * counts_rows = ggml_fill(
                 ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, sctx->n_vocab), 0.0f);
         ggml_tensor * scatter_rows = ggml_reshape_2d(ctx, counts_f32, 1, sctx->n_max);
-        counts_rows = ggml_set_rows(ctx, counts_rows, scatter_rows, sctx->inp_token_ids);
+        counts_rows = ggml_set_rows(ctx, counts_rows, scatter_rows, in.token_ids);
         counts_f32 = ggml_get_rows(ctx, counts_rows, candidates);
         counts_f32 = ggml_reshape_1d(ctx, counts_f32, n_candidates);
     } else {
         ggml_tensor * logits_rows = ggml_reshape_2d(ctx, logits, 1, ggml_nelements(logits));
-        gathered = ggml_get_rows(ctx, logits_rows, sctx->inp_token_ids);
+        gathered = ggml_get_rows(ctx, logits_rows, in.token_ids);
         gathered = ggml_reshape_1d(ctx, gathered, sctx->n_max);
     }
 
@@ -3130,7 +3535,7 @@ static void llama_sampler_penalties_backend_apply(
     } else {
         ggml_tensor * logits_rows = ggml_reshape_2d(ctx, logits, 1, ggml_nelements(logits));
         ggml_tensor * scatter_rows = ggml_reshape_2d(ctx, penalized, 1, sctx->n_max);
-        logits_rows = ggml_set_rows(ctx, logits_rows, scatter_rows, sctx->inp_token_ids);
+        logits_rows = ggml_set_rows(ctx, logits_rows, scatter_rows, in.token_ids);
         data->logits = ggml_reshape_1d(ctx, logits_rows, ggml_nelements(logits));
     }
 }
@@ -3138,7 +3543,7 @@ static void llama_sampler_penalties_backend_apply(
 static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_penalties *) smpl->ctx;
 
-    if (!sctx->inp_token_ids || !sctx->inp_counts || sctx->n_max <= 0 || sctx->n_vocab <= 0) {
+    if (sctx->inputs.empty() || sctx->n_max <= 0 || sctx->n_vocab <= 0) {
         return;
     }
 
@@ -3146,58 +3551,52 @@ static void llama_sampler_penalties_backend_set_input(struct llama_sampler * smp
         return;
     }
 
-    // fill active entries from the map
-    int32_t n_active = 0;
-
-    for (const auto & it : sctx->token_count) {
-        GGML_ASSERT(n_active < sctx->n_max);
-        sctx->host_token_ids[n_active] = it.first;
-        sctx->host_counts   [n_active] = it.second;
-        ++n_active;
-    }
-
-    // Sorting is required because backend_apply uses ggml_set_rows (a scatter-back operation)
-    std::vector<std::pair<int32_t, int32_t>> entries;
-    entries.reserve(n_active);
-    for (int32_t i = 0; i < n_active; ++i) {
-        entries.emplace_back(sctx->host_token_ids[i], sctx->host_counts[i]);
-    }
-    std::sort(entries.begin(), entries.end(), [](const auto & a, const auto & b) {
-        return a.first < b.first;
-    });
-    for (int32_t i = 0; i < n_active; ++i) {
-        sctx->host_token_ids[i] = entries[i].first;
-        sctx->host_counts   [i] = entries[i].second;
-    }
-
-    // Padding: Finds a filler token id that is not present in token_count.
-    // Use it to do padding for the arrays, it avoids resizing every time.
-    // The arrays must always have exactly n_max entries (the GPU tensor is a fixed size).
-    int32_t filler = 0;
-    if (n_active < sctx->n_max) {
-        while (sctx->token_count.find(filler) != sctx->token_count.end()) {
-            ++filler;
+    std::vector<llama_token> history = sctx->prev.to_vector();
+    for (size_t row = 0; row < sctx->inputs.size(); ++row) {
+        std::unordered_map<llama_token, int32_t> counts;
+        for (const llama_token token : history) {
+            ++counts[token];
         }
-        GGML_ASSERT(filler < sctx->n_vocab);
-    }
 
-    // Fill the rest of the arrays with the filler token id and count 0.
-    // Inactive slots are padded with a unique dummy token ID (count = 0).
-    // The uniqueness matters because ggml_set_rows with duplicate indices can produce non-deterministic or incorrect results.
-    // Using a filler token with count 0 that isn't in the active set is safe, because the active_mask step in backend_apply filters them out via ggml_step(counts_f32)
-    for (int32_t i = n_active; i < sctx->n_max; ++i) {
-        sctx->host_token_ids[i] = filler;
-        sctx->host_counts   [i] = 0;
-    }
+        std::vector<std::pair<int32_t, int32_t>> entries(counts.begin(), counts.end());
+        std::sort(entries.begin(), entries.end(), [](const auto & a, const auto & b) {
+            return a.first < b.first;
+        });
+        GGML_ASSERT(entries.size() <= (size_t) sctx->n_max);
 
-    ggml_backend_tensor_set(sctx->inp_token_ids, sctx->host_token_ids.data(), 0, sctx->n_max * sizeof(int32_t));
-    ggml_backend_tensor_set(sctx->inp_counts,    sctx->host_counts.data(),    0, sctx->n_max * sizeof(int32_t));
+        const int32_t n_active = entries.size();
+        for (int32_t i = 0; i < n_active; ++i) {
+            sctx->host_token_ids[i] = entries[i].first;
+            sctx->host_counts[i] = entries[i].second;
+        }
+
+        int32_t filler = 0;
+        for (int32_t i = n_active; i < sctx->n_max; ++i) {
+            while (counts.find(filler) != counts.end()) {
+                ++filler;
+            }
+            GGML_ASSERT(filler < sctx->n_vocab);
+            sctx->host_token_ids[i] = filler++;
+            sctx->host_counts[i] = 0;
+        }
+
+        ggml_backend_tensor_set(sctx->inputs[row].token_ids,
+                sctx->host_token_ids.data(), 0, sctx->n_max * sizeof(int32_t));
+        ggml_backend_tensor_set(sctx->inputs[row].counts,
+                sctx->host_counts.data(), 0, sctx->n_max * sizeof(int32_t));
+
+        if (row < sctx->speculative_draft.size()) {
+            if (history.size() == (size_t) sctx->penalty_last_n) {
+                history.erase(history.begin());
+            }
+            history.push_back(sctx->speculative_draft[row]);
+        }
+    }
 }
 
 static void llama_sampler_penalties_backend_reset(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_penalties *) smpl->ctx;
-    sctx->inp_token_ids = nullptr;
-    sctx->inp_counts    = nullptr;
+    sctx->inputs.clear();
 }
 
 static struct llama_sampler_i llama_sampler_penalties_i = {
@@ -3214,6 +3613,24 @@ static struct llama_sampler_i llama_sampler_penalties_i = {
     /* .backend_reset     = */ llama_sampler_penalties_backend_reset,
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_penalties>,
 };
+
+static void llama_sampler_chain_set_speculative_penalties(
+        llama_sampler * chain, const llama_token * draft, int32_t n_draft) {
+    if (chain == nullptr || chain->iface != &llama_sampler_chain_i) {
+        return;
+    }
+    auto * cctx = (llama_sampler_chain *) chain->ctx;
+    for (auto & entry : cctx->samplers) {
+        if (entry.ptr->iface == &llama_sampler_penalties_i) {
+            auto * pctx = (llama_sampler_penalties *) entry.ptr->ctx;
+            if (n_draft > 0) {
+                pctx->speculative_draft.assign(draft, draft + n_draft);
+            } else {
+                pctx->speculative_draft.clear();
+            }
+        }
+    }
+}
 
 int32_t llama_sampler_backend_batch_prefilter_k(const llama_sampler * sampler) {
     if (!sampler || sampler->iface != &llama_sampler_chain_i) {

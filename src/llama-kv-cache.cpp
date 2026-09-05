@@ -367,13 +367,19 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
-bool llama_kv_cache::configure_paged(uint32_t block_size, uint32_t max_seq_tokens) {
+bool llama_kv_cache::configure_paged(
+        uint32_t block_size,
+        uint32_t max_seq_tokens,
+        uint32_t attn_sink_tokens,
+        uint32_t attn_window_tokens) {
     if (other || n_stream != 1 || v_trans || block_size == 0 || max_seq_tokens == 0 || (block_size & (block_size - 1)) != 0) {
         return false;
     }
 
     paged = true;
     paged_max_pages = (max_seq_tokens + block_size - 1) / block_size;
+    paged_attn_sink = attn_sink_tokens;
+    paged_attn_window = attn_window_tokens;
     block_allocators.resize(n_stream);
     for (uint32_t strm = 0; strm < n_stream; ++strm) {
         block_allocators[strm].init(v_cells[strm].size(), block_size);
@@ -384,6 +390,10 @@ bool llama_kv_cache::configure_paged(uint32_t block_size, uint32_t max_seq_token
 
     LLAMA_LOG_INFO("%s: enabled, block_size = %u, blocks = %u, max_pages_per_seq = %u\n",
             __func__, block_size, block_allocators[0].n_blocks(), paged_max_pages);
+    if (paged_attn_window > 0) {
+        LLAMA_LOG_INFO("%s: sparse decode attention enabled, sink = %u tokens, recent = %u tokens\n",
+                __func__, paged_attn_sink, paged_attn_window);
+    }
     return block_allocators[0].n_blocks() > 0;
 }
 
@@ -1795,8 +1805,86 @@ ggml_tensor * llama_kv_cache::build_input_page_limits_q(ggml_context * ctx, cons
     return result;
 }
 
-void llama_kv_cache::set_input_block_table(ggml_tensor * dst) const {
-    if (!paged || !dst) {
+std::vector<llama_kv_cache::paged_attn_view> llama_kv_cache::get_paged_attn_views(
+        const llama_ubatch * ubatch,
+        const slot_info & sinfo) const {
+    std::vector<paged_attn_view> views(n_seq_max);
+
+    if (!paged || paged_attn_window == 0 || !ubatch || ubatch->n_tokens == 0 ||
+            swa_type != LLAMA_SWA_TYPE_NONE) {
+        return views;
+    }
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        if (!ubatch->output[i]) {
+            return views;
+        }
+    }
+
+    const uint32_t n_streams = sinfo.n_stream();
+    GGML_ASSERT(n_streams > 0 && ubatch->n_tokens % n_streams == 0);
+    const uint32_t n_tps = ubatch->n_tokens / n_streams;
+    const uint32_t block_size = block_allocators[0].block_size();
+    const uint32_t sink_pages_cfg = (uint64_t(paged_attn_sink) + block_size - 1) / block_size;
+
+    std::vector<uint32_t> max_query_idx(n_seq_max, 0);
+    std::vector<bool> seen(n_seq_max, false);
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+            return std::vector<paged_attn_view>(n_seq_max);
+        }
+
+        const uint32_t strm = i / n_tps;
+        const uint32_t logical_idx = sinfo.lidxs[strm][i % n_tps];
+        max_query_idx[seq_id] = std::max(max_query_idx[seq_id], logical_idx);
+        seen[seq_id] = true;
+    }
+
+    for (uint32_t seq_id = 0; seq_id < n_seq_max; ++seq_id) {
+        if (!seen[seq_id]) {
+            continue;
+        }
+
+        auto & view = views[seq_id];
+        view.end_page = llama_kv_block_table::logical_page(max_query_idx[seq_id], block_size) + 1;
+        view.sink_pages = std::min(sink_pages_cfg, view.end_page);
+
+        const uint64_t end_token = uint64_t(max_query_idx[seq_id]) + 1;
+        const uint64_t recent_start_token = end_token > paged_attn_window ? end_token - paged_attn_window : 0;
+        view.recent_start_page = std::max<uint32_t>(view.sink_pages, recent_start_token / block_size);
+
+        if (view.recent_start_page <= view.sink_pages) {
+            continue;
+        }
+
+        bool queries_visible = true;
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            if (ubatch->seq_id[i][0] != (llama_seq_id) seq_id) {
+                continue;
+            }
+            const uint32_t strm = i / n_tps;
+            const uint32_t logical_idx = sinfo.lidxs[strm][i % n_tps];
+            const uint32_t query_page = llama_kv_block_table::logical_page(logical_idx, block_size);
+            if (query_page >= view.sink_pages && query_page < view.recent_start_page) {
+                queries_visible = false;
+                break;
+            }
+        }
+
+        view.sparse = queries_visible &&
+                view.sink_pages + view.end_page - view.recent_start_page < view.end_page;
+    }
+
+    return views;
+}
+
+void llama_kv_cache::set_input_block_table(
+        ggml_tensor * dst,
+        const llama_ubatch * ubatch,
+        const slot_info & sinfo) const {
+    if (!paged || !dst || !ubatch) {
         return;
     }
 
@@ -1806,6 +1894,7 @@ void llama_kv_cache::set_input_block_table(ggml_tensor * dst) const {
     const uint32_t max_pages = dst->ne[0];
     const uint32_t n_seqs = dst->ne[1];
     int32_t * data = (int32_t *) dst->data;
+    const auto views = get_paged_attn_views(ubatch, sinfo);
 
     for (uint32_t seq_id = 0; seq_id < n_seqs; ++seq_id) {
         int32_t * row = data + size_t(seq_id) * max_pages;
@@ -1815,10 +1904,23 @@ void llama_kv_cache::set_input_block_table(ggml_tensor * dst) const {
         if (!pages) {
             continue;
         }
-        for (uint32_t page = 0; page < pages->size() && page < max_pages; ++page) {
+        const auto & view = views[seq_id];
+        const uint32_t sink_pages = view.sparse ? view.sink_pages : 0;
+        const uint32_t recent_start_page = view.sparse ? view.recent_start_page : 0;
+        const uint32_t end_page = view.sparse ? std::min<uint32_t>(view.end_page, pages->size()) : pages->size();
+        const uint32_t n_view_pages = view.sparse ? sink_pages + end_page - recent_start_page : end_page;
+
+        if (view.sparse && debug >= 2) {
+            LLAMA_LOG_DEBUG("%s: seq %u sparse pages [0, %u) + [%u, %u) -> %u pages\n",
+                    __func__, seq_id, sink_pages, recent_start_page, end_page, n_view_pages);
+        }
+
+        for (uint32_t view_page = 0; view_page < n_view_pages && view_page < max_pages; ++view_page) {
+            const uint32_t page = view.sparse && view_page >= sink_pages ?
+                    recent_start_page + view_page - sink_pages : view_page;
             const uint32_t block = (*pages)[page];
             if (block != LLAMA_KV_BLOCK_ID_NONE) {
-                row[page] = block;
+                row[view_page] = block;
             }
         }
     }
@@ -1853,14 +1955,20 @@ void llama_kv_cache::set_input_page_limits_q(ggml_tensor * dst, const llama_ubat
     const uint32_t block_size = block_allocators[0].block_size();
     const uint32_t n_tps = ubatch->n_tokens / sinfo.n_stream();
     int32_t * data = (int32_t *) dst->data;
+    const auto views = get_paged_attn_views(ubatch, sinfo);
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         GGML_ASSERT(ubatch->pos[i] >= 0);
         const uint32_t strm = i / n_tps;
         const uint32_t logical_idx = sinfo.lidxs[strm][i % n_tps];
         int32_t page_start = 0;
-        const int32_t page_end = llama_kv_block_table::logical_page(logical_idx, block_size) + 1;
+        const uint32_t logical_page = llama_kv_block_table::logical_page(logical_idx, block_size);
+        const auto & view = views[ubatch->seq_id[i][0]];
+        const int32_t page_end = view.sparse ?
+                (logical_page < view.sink_pages ? logical_page + 1 :
+                 view.sink_pages + logical_page - view.recent_start_page + 1) :
+                logical_page + 1;
 
-        if (!ubatch->is_pos_2d() && swa_type != LLAMA_SWA_TYPE_NONE && n_swa > 0) {
+        if (!view.sparse && !ubatch->is_pos_2d() && swa_type != LLAMA_SWA_TYPE_NONE && n_swa > 0) {
             if (logical_idx >= n_swa) {
                 page_start = llama_kv_block_table::logical_page(logical_idx - n_swa + 1, block_size);
             }
@@ -3299,8 +3407,8 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
-void llama_kv_cache_context::set_input_block_table(ggml_tensor * dst) const {
-    kv->set_input_block_table(dst);
+void llama_kv_cache_context::set_input_block_table(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_block_table(dst, ubatch, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const {

@@ -43,6 +43,23 @@ void llama_sampler_backend_begin(llama_sampler * sampler);
 // A zero return value means that the chain is not eligible for batched prefiltering.
 int32_t llama_sampler_backend_batch_prefilter_k(const llama_sampler * sampler);
 
+// GPU-side speculative rejection sampler. The proposal probabilities are
+// sparse and uploaded as graph inputs; target probabilities never leave the
+// sampling graph.
+llama_sampler * llama_sampler_init_speculative_rejection(
+        int32_t n_vocab, int32_t max_q, uint32_t seed);
+
+bool llama_sampler_speculative_rejection_set(
+        llama_sampler * chain,
+        int32_t n_draft,
+        const llama_token * draft,
+        const int32_t * q_counts,
+        const llama_token * q_ids,
+        const float * q_probs,
+        int32_t q_stride);
+
+bool llama_sampler_speculative_rejection_backend_enabled(const llama_sampler * chain);
+
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,
         float   dry_base,

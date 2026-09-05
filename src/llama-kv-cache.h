@@ -147,7 +147,11 @@ public:
 
     bool get_can_shift() const override;
 
-    bool configure_paged(uint32_t block_size, uint32_t max_seq_tokens) override;
+    bool configure_paged(
+            uint32_t block_size,
+            uint32_t max_seq_tokens,
+            uint32_t attn_sink_tokens,
+            uint32_t attn_window_tokens) override;
     uint32_t get_n_free_blocks() const override;
 
     void clear(bool data) override;
@@ -244,7 +248,7 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
-    void set_input_block_table(ggml_tensor * dst) const;
+    void set_input_block_table(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_page_limits_q(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
@@ -336,8 +340,21 @@ private:
 
     bool paged = false;
     uint32_t paged_max_pages = 0;
+    uint32_t paged_attn_sink = 0;
+    uint32_t paged_attn_window = 0;
     std::vector<llama_kv_block_allocator> block_allocators;
     llama_kv_block_table block_table;
+
+    struct paged_attn_view {
+        bool sparse = false;
+        uint32_t sink_pages = 0;
+        uint32_t recent_start_page = 0;
+        uint32_t end_page = 0;
+    };
+
+    std::vector<paged_attn_view> get_paged_attn_views(
+            const llama_ubatch * ubatch,
+            const slot_info & sinfo) const;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
@@ -459,7 +476,7 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_block_table(ggml_tensor * dst) const;
+    void set_input_block_table(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_seq_ids_q(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_page_limits_q(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 

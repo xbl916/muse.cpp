@@ -269,6 +269,56 @@ static void test(void) {
     }
 
     {
+        common_params adaptive_params;
+        argv = {
+            "binary_name",
+            "--spec-adaptive",
+            "--spec-adaptive-window", "32",
+            "--spec-adaptive-min-gen", "128",
+            "--spec-adaptive-min-context", "1024",
+            "--spec-adaptive-min-accept", "0.7",
+            "--spec-adaptive-max-empty-rate", "0.15",
+            "--spec-adaptive-patience", "3",
+            "--spec-adaptive-reasoning-hard-off",
+            "--spec-acceptance-log-tokens", "1024",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SERVER));
+        assert(adaptive_params.speculative.draft.adaptive);
+        assert(adaptive_params.speculative.draft.adaptive_window == 32);
+        assert(adaptive_params.speculative.draft.adaptive_min_gen == 128);
+        assert(adaptive_params.speculative.draft.adaptive_min_context == 1024);
+        assert(adaptive_params.speculative.draft.adaptive_min_accept == 0.7f);
+        assert(adaptive_params.speculative.draft.adaptive_max_empty_rate == 0.15f);
+        assert(adaptive_params.speculative.draft.adaptive_patience == 3);
+        assert(adaptive_params.speculative.draft.adaptive_reasoning_hard_off);
+        assert(adaptive_params.speculative.draft.acceptance_log_tokens == 1024);
+    }
+
+    {
+        common_params adaptive_params;
+        argv = {"binary_name", "--no-spec-adaptive-reasoning-hard-off"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SERVER));
+        assert(!adaptive_params.speculative.draft.adaptive_reasoning_hard_off);
+    }
+
+    {
+        const char * invalid_options[][2] = {
+            {"--spec-adaptive-window", "0"},
+            {"--spec-adaptive-min-gen", "-1"},
+            {"--spec-adaptive-min-context", "-1"},
+            {"--spec-adaptive-min-accept", "1.1"},
+            {"--spec-adaptive-max-empty-rate", "nan"},
+            {"--spec-adaptive-patience", "0"},
+            {"--spec-acceptance-log-tokens", "-1"},
+        };
+        for (const auto & option : invalid_options) {
+            common_params adaptive_params;
+            argv = {"binary_name", option[0], option[1]};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SERVER));
+        }
+    }
+
+    {
         common_params synth_params;
         argv = {"binary_name", "--spec-synth-len", "3.4x"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));

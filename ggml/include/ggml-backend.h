@@ -208,6 +208,17 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+    typedef bool   (*ggml_backend_comm_gather_tensor_t)(void * comm_ctx, struct ggml_tensor ** src, struct ggml_tensor * dst);
+    typedef bool   (*ggml_backend_comm_graph_compatible_t)(void * comm_ctx);
+    typedef bool   (*ggml_backend_comm_gather_graph_compatible_t)(void * comm_ctx);
+
+    // Optional stream-capture hooks used by composite backends to capture a complete graph across backend boundaries.
+    typedef bool   (*ggml_backend_graph_capture_compatible_t)(ggml_backend_t backend, const struct ggml_cgraph * cgraph);
+    typedef bool   (*ggml_backend_graph_capture_begin_t)(ggml_backend_t backend);
+    typedef void * (*ggml_backend_graph_capture_end_t)(ggml_backend_t backend);
+    typedef bool   (*ggml_backend_graph_capture_finalize_t)(ggml_backend_t backend, void * graph);
+    typedef bool   (*ggml_backend_graph_capture_launch_t)(ggml_backend_t backend, void * graph);
+    typedef void   (*ggml_backend_graph_capture_free_t)(ggml_backend_t backend, void * graph);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);

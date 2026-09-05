@@ -58,7 +58,11 @@ public:
 
     bool get_can_shift() const override;
 
-    bool configure_paged(uint32_t block_size, uint32_t max_seq_tokens) override;
+    bool configure_paged(
+            uint32_t block_size,
+            uint32_t max_seq_tokens,
+            uint32_t attn_sink_tokens,
+            uint32_t attn_window_tokens) override;
     uint32_t get_n_free_blocks() const override;
 
     void clear(bool data) override;

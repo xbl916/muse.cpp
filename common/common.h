@@ -293,6 +293,29 @@ struct common_params_sampling {
     std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
+    // Optional per-effort budgets. The server resolves these to reasoning_budget_tokens per request.
+    std::map<std::string, int32_t> reasoning_budget_by_effort;
+    std::map<std::string, float>   reasoning_converge_ratio_by_effort;
+    std::map<std::string, int32_t> reasoning_converge_tokens_by_effort;
+    std::map<std::string, int32_t> reasoning_converge_bias_delay_by_effort;
+    float       reasoning_converge_ratio = -1.0f;
+    int32_t     reasoning_converge_tokens = -1;
+    std::string reasoning_converge_marker;
+    std::string reasoning_converge_message =
+        "The reasoning is sufficient. I will now provide the complete final answer based on the decisions above.";
+    int32_t     reasoning_converge_boundary_tokens = 96;
+    int32_t     reasoning_converge_bias_delay_tokens = 128;
+    float       reasoning_converge_max_bias = 6.0f;
+    int32_t     reasoning_hard_boundary_tokens = 96;
+
+    // Legacy one-shot wrap-up hint controls. Per-effort convergence does not use these.
+    float       reasoning_budget_soft_ratio   = -1.0f; // -1 = disabled, 0 < ratio < 1 enables a one-shot wrap-up hint
+    std::string reasoning_budget_soft_message =
+        "\nThe remaining reasoning budget is limited. Stop expanding optional detail. "
+        "Complete only the essential reasoning and one brief correctness check, then begin the final answer.\n";
+    int32_t     reasoning_budget_soft_boundary_tokens = 64; // max tokens to wait for a safe text boundary before the soft hint
+    int32_t     reasoning_budget_grace_tokens = 0;     // extra generated reasoning tokens allowed after the hard budget
+
     bool backend_sampling = false;
 
     // print the parameters into a string
@@ -330,10 +353,27 @@ struct common_params_speculative_draft {
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+    bool probabilistic    = false; // sample MTP drafts and verify them with p/q rejection sampling
 
     // Physical batch size used only by an in-model MTP context. Zero inherits
     // the target context setting so large catch-up buffers are never implicit.
     int32_t mtp_ubatch = 0;
+
+    // Server-side adaptive MTP. Each request starts enabled and permanently
+    // disables MTP for the rest of that request after enough bad windows.
+    // Reasoning windows are ignored by default and content starts a fresh window.
+    bool    adaptive                = false;
+    int32_t adaptive_window         = 64;
+    int32_t adaptive_min_gen        = 256;
+    int32_t adaptive_min_context    = 2048;
+    float   adaptive_min_accept     = 0.65f;
+    float   adaptive_max_empty_rate = 0.25f;
+    int32_t adaptive_patience       = 2;
+    bool    adaptive_reasoning_hard_off = false;
+
+    // Emit per-request MTP acceptance progress every N generated tokens.
+    // Zero disables intermediate logging; final request statistics are unchanged.
+    int32_t acceptance_log_tokens = 2048;
 
     common_params_model mparams;
 
@@ -583,6 +623,8 @@ struct common_params {
     std::string paged_admission = "actual-len";
     float paged_gpu_memory_utilization = 0.90f;
     int32_t kv_block_size  = 32;
+    int32_t paged_attn_sink = 0;
+    int32_t paged_attn_window = 0;
     int32_t paged_prefill_chunk = 128;
     float paged_prefill_target_ms = 50.0f;
     int32_t paged_decode_steps = 3;

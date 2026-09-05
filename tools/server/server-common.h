@@ -315,6 +315,20 @@ struct server_chat_params {
     bool enable_thinking = true;
     int  reasoning_budget = -1;
     std::string reasoning_budget_message;
+    std::map<std::string, int32_t> reasoning_budget_by_effort;
+    std::map<std::string, float> reasoning_converge_ratio_by_effort;
+    std::map<std::string, int32_t> reasoning_converge_tokens_by_effort;
+    std::map<std::string, int32_t> reasoning_converge_bias_delay_by_effort;
+    std::string reasoning_converge_marker;
+    std::string reasoning_converge_message;
+    int reasoning_converge_boundary_tokens = 96;
+    int reasoning_converge_bias_delay_tokens = 128;
+    float reasoning_converge_max_bias = 6.0f;
+    int reasoning_hard_boundary_tokens = 96;
+    float reasoning_budget_soft_ratio = -1.0f;
+    std::string reasoning_budget_soft_message;
+    int reasoning_budget_soft_boundary_tokens = 64;
+    int reasoning_budget_grace_tokens = 0;
     std::string media_path;
     bool force_pure_content = false;
 };
@@ -359,6 +373,11 @@ struct server_slot_stats {
     uint64_t n_draft_tokens      = 0;
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
+
+    bool     spec_adaptive_hard_off  = false;
+    uint64_t spec_adaptive_switch_gen = 0;
+    float    spec_adaptive_acceptance = 0.0f;
+    float    spec_adaptive_empty_rate = 0.0f;
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set

@@ -480,7 +480,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     }
 
     if (self_block_table && self_block_table->buffer) {
-        mctx->set_input_block_table(self_block_table);
+        mctx->set_input_block_table(self_block_table, ubatch);
     }
     if (self_seq_ids_q && self_seq_ids_q->buffer) {
         mctx->set_input_seq_ids_q(self_seq_ids_q, ubatch);
@@ -1105,7 +1105,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
     if (inp_attn->self_block_table && inp_attn->self_block_table->buffer) {
-        mctx->get_attn()->set_input_block_table(inp_attn->self_block_table);
+        mctx->get_attn()->set_input_block_table(inp_attn->self_block_table, ubatch);
     }
     if (inp_attn->self_seq_ids_q && inp_attn->self_seq_ids_q->buffer) {
         mctx->get_attn()->set_input_seq_ids_q(inp_attn->self_seq_ids_q, ubatch);

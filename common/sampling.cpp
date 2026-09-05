@@ -170,6 +170,46 @@ struct common_sampler {
     mutable int64_t t_total_us = 0;
 };
 
+void common_speculative_diagnostics::reset() {
+    n.clear();
+    target_argmax_matches.clear();
+    target_draft_prob_sum.clear();
+}
+
+static void common_sampler_record_speculative_diagnostics(
+        const common_sampler * gsmpl,
+        size_t pos,
+        llama_token draft,
+        common_speculative_diagnostics * diagnostics) {
+    if (diagnostics == nullptr || gsmpl->cur_p.data == nullptr || gsmpl->cur_p.size == 0) {
+        return;
+    }
+
+    if (diagnostics->n.size() <= pos) {
+        diagnostics->n.resize(pos + 1);
+        diagnostics->target_argmax_matches.resize(pos + 1);
+        diagnostics->target_draft_prob_sum.resize(pos + 1);
+    }
+
+    const llama_token_data * target_argmax = nullptr;
+    double draft_p = 0.0;
+    for (size_t i = 0; i < gsmpl->cur_p.size; ++i) {
+        const auto & candidate = gsmpl->cur_p.data[i];
+        if (std::isfinite(candidate.p) && candidate.p >= 0.0f) {
+            if (target_argmax == nullptr || candidate.p > target_argmax->p) {
+                target_argmax = &candidate;
+            }
+            if (candidate.id == draft) {
+                draft_p = candidate.p;
+            }
+        }
+    }
+
+    diagnostics->n[pos]++;
+    diagnostics->target_draft_prob_sum[pos] += draft_p;
+    diagnostics->target_argmax_matches[pos] += target_argmax != nullptr && target_argmax->id == draft;
+}
+
 std::string common_params_sampling::print() const {
     char result[1024];
 
@@ -311,16 +351,92 @@ struct common_sampler * common_sampler_init(
 
     // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
     if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
+        llama_tokens soft_tokens;
+        const bool convergence_enabled = params.reasoning_budget_tokens > 0 &&
+                params.reasoning_converge_ratio > 0.0f &&
+                params.reasoning_converge_ratio < 1.0f &&
+                params.reasoning_converge_tokens >= 0;
+        const float soft_ratio = convergence_enabled ?
+                params.reasoning_converge_ratio : params.reasoning_budget_soft_ratio;
+        std::string soft_message = params.reasoning_budget_soft_message;
+        if (convergence_enabled &&
+                (!params.reasoning_converge_marker.empty() || !params.reasoning_converge_message.empty())) {
+            soft_message = "\n";
+            if (!params.reasoning_converge_marker.empty()) {
+                soft_message += params.reasoning_converge_marker;
+            }
+            if (!params.reasoning_converge_message.empty()) {
+                if (!params.reasoning_converge_marker.empty()) {
+                    soft_message += "\n";
+                }
+                soft_message += params.reasoning_converge_message;
+            }
+            soft_message += "\n\n";
+        }
+        if (params.reasoning_budget_tokens > 0 &&
+                soft_ratio > 0.0f &&
+                soft_ratio < 1.0f &&
+                !soft_message.empty()) {
+            soft_tokens = common_tokenize(vocab, soft_message, false, true);
+
+            const auto contains_sequence = [&](const llama_tokens & seq) {
+                return !seq.empty() && std::search(
+                        soft_tokens.begin(), soft_tokens.end(), seq.begin(), seq.end()) != soft_tokens.end();
+            };
+            if (contains_sequence(params.reasoning_budget_start)) {
+                throw std::invalid_argument("reasoning handoff transition must not contain the reasoning start tag");
+            }
+            for (const auto & end : params.reasoning_budget_end) {
+                if (contains_sequence(end)) {
+                    throw std::invalid_argument("reasoning handoff transition must not contain a reasoning end tag");
+                }
+            }
+            for (const llama_token token : soft_tokens) {
+                if (llama_vocab_is_eog(vocab, token)) {
+                    throw std::invalid_argument("reasoning handoff transition must not contain an end-of-generation token");
+                }
+            }
+        }
+
+        const int32_t hard_boundary_tokens = params.reasoning_budget_grace_tokens > 0 ?
+                params.reasoning_budget_grace_tokens : params.reasoning_hard_boundary_tokens;
         rbudget = common_reasoning_budget_init(
             vocab,
             {params.reasoning_budget_start},
             params.reasoning_budget_end,
             params.reasoning_budget_forced,
-            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
+            params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens,
+            REASONING_BUDGET_IDLE,
+            soft_ratio,
+            soft_tokens,
+            hard_boundary_tokens,
+            convergence_enabled ? params.reasoning_converge_boundary_tokens : params.reasoning_budget_soft_boundary_tokens,
+            convergence_enabled ? params.reasoning_converge_tokens : -1,
+            convergence_enabled ? params.reasoning_converge_max_bias : 0.0f,
+            convergence_enabled ? params.reasoning_converge_bias_delay_tokens : 0);
+
+        bool prefill_has_reasoning_end = false;
+        for (const auto & end : params.reasoning_budget_end) {
+            if (!end.empty() && std::search(
+                    prefill_tokens.begin(), prefill_tokens.end(), end.begin(), end.end()) != prefill_tokens.end()) {
+                prefill_has_reasoning_end = true;
+                break;
+            }
+        }
 
         for (const auto & token : prefill_tokens) {
+            const auto state_before = common_reasoning_budget_get_state(rbudget);
             llama_sampler_accept(rbudget, token);
             LOG_DBG("%s: reasoning-budget accepted prefill token (%d)\n", __func__, token);
+
+            // Once the fixed generation prompt opens the reasoning block, all
+            // remaining prefill text is still prompt data, not generated output.
+            // A non-thinking template prefills the closing tag too; replay that
+            // complete block so normal answer tokens are never budgeted.
+            if (!prefill_has_reasoning_end && state_before == REASONING_BUDGET_IDLE &&
+                    common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_IDLE) {
+                break;
+            }
         }
     }
 
@@ -697,7 +813,13 @@ llama_token common_sampler_sample_prepared(struct common_sampler * gsmpl, bool g
     return id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        bool grammar_first,
+        struct common_speculative_diagnostics * diagnostics) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
@@ -706,6 +828,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        common_sampler_record_speculative_diagnostics(gsmpl, i, draft[i], diagnostics);
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -734,6 +858,177 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_probabilistic(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_probs,
+        std::mt19937 & rng,
+        bool grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+    GGML_ASSERT(draft_probs.size() == draft.size());
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    auto uniform = [&]() {
+        return std::generate_canonical<double, 53>(rng);
+    };
+
+    size_t i = 0;
+    for (; i < draft.size(); ++i) {
+        // Applying the normal target chain produces the exact request-specific
+        // distribution, including penalties, grammar and reasoning controls.
+        // Its selected token is only a numerical fallback; the p/q test below
+        // decides which token is committed to sampler history.
+        common_sampler_prepare(gsmpl, ctx, idxs[i]);
+
+        // Probabilistic verification needs the complete post-sampler target
+        // distribution. A backend-selected token alone is insufficient, so
+        // deliberately rerun the request sampler chain on the host here.
+        gsmpl->prepared_token = LLAMA_TOKEN_NULL;
+        const llama_token target_fallback = common_sampler_sample_prepared(gsmpl, grammar_first);
+        const auto * target = common_sampler_get_candidates(gsmpl, false);
+
+        double p_sum = 0.0;
+        double q_sum = 0.0;
+        for (size_t j = 0; j < target->size; ++j) {
+            if (std::isfinite(target->data[j].p) && target->data[j].p > 0.0f) {
+                p_sum += target->data[j].p;
+            }
+        }
+        for (const auto & candidate : draft_probs[i]) {
+            if (std::isfinite(candidate.p) && candidate.p > 0.0f) {
+                q_sum += candidate.p;
+            }
+        }
+
+        double p_draft = 0.0;
+        double q_draft = 0.0;
+        if (p_sum > 0.0) {
+            for (size_t j = 0; j < target->size; ++j) {
+                if (target->data[j].id == draft[i]) {
+                    p_draft = std::max(0.0, (double) target->data[j].p) / p_sum;
+                    break;
+                }
+            }
+        }
+        if (q_sum > 0.0) {
+            for (const auto & candidate : draft_probs[i]) {
+                if (candidate.id == draft[i]) {
+                    q_draft = std::max(0.0, (double) candidate.p) / q_sum;
+                    break;
+                }
+            }
+        }
+
+        const double accept_p = q_draft > 0.0 ? std::min(1.0, p_draft / q_draft) : 0.0;
+        if (uniform() < accept_p) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        // On rejection, sample from normalized max(p - q, 0). This correction
+        // is what preserves the target distribution despite stochastic drafts.
+        double residual_sum = 0.0;
+        std::vector<double> residual(target->size, 0.0);
+        for (size_t j = 0; j < target->size; ++j) {
+            const double p = p_sum > 0.0 ? std::max(0.0, (double) target->data[j].p) / p_sum : 0.0;
+            double q = 0.0;
+            if (q_sum > 0.0) {
+                for (const auto & candidate : draft_probs[i]) {
+                    if (candidate.id == target->data[j].id) {
+                        q = std::max(0.0, (double) candidate.p) / q_sum;
+                        break;
+                    }
+                }
+            }
+            residual[j] = std::max(0.0, p - q);
+            residual_sum += residual[j];
+        }
+
+        llama_token id = target_fallback;
+        if (residual_sum > 1e-12) {
+            double r = uniform() * residual_sum;
+            for (size_t j = 0; j < target->size; ++j) {
+                r -= residual[j];
+                if (r <= 0.0) {
+                    id = target->data[j].id;
+                    break;
+                }
+            }
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        break;
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+    }
+
+    return result;
+}
+
+void common_sampler_enable_probabilistic_backend(
+        struct common_sampler * gsmpl, const struct llama_model * model, uint32_t seed) {
+    GGML_ASSERT(gsmpl != nullptr);
+    GGML_ASSERT(model != nullptr);
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    if (gsmpl->params.top_k <= 0) {
+        LOG_WRN("%s: probabilistic backend verification requires a finite top-k; using host verification\n", __func__);
+        return;
+    }
+    const int32_t max_q = std::min(n_vocab, gsmpl->params.top_k);
+    const int32_t n = llama_sampler_chain_n(gsmpl->chain);
+    if (n <= 0 || std::strcmp(llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, n - 1)), "dist") != 0) {
+        LOG_WRN("%s: probabilistic backend verification requires the dist sampler; using host verification\n", __func__);
+        return;
+    }
+
+    llama_sampler_chain_add(gsmpl->chain, llama_sampler_init_speculative_rejection(
+            n_vocab, max_q, seed ^ 0x9e3779b9U));
+}
+
+bool common_sampler_set_probabilistic_draft(
+        struct common_sampler * gsmpl,
+        const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_probs) {
+    if (gsmpl == nullptr || draft.size() != draft_probs.size()) {
+        return false;
+    }
+    int32_t stride = 1;
+    for (const auto & row : draft_probs) {
+        stride = std::max<int32_t>(stride, row.size());
+    }
+    std::vector<int32_t> counts(draft.size());
+    std::vector<llama_token> ids(draft.size() * stride, 0);
+    std::vector<float> probs(draft.size() * stride, 0.0f);
+    for (size_t i = 0; i < draft.size(); ++i) {
+        counts[i] = draft_probs[i].size();
+        for (size_t k = 0; k < draft_probs[i].size(); ++k) {
+            ids[i * stride + k] = draft_probs[i][k].id;
+            probs[i * stride + k] = draft_probs[i][k].p;
+        }
+    }
+    return llama_sampler_speculative_rejection_set(
+            gsmpl->chain, draft.size(), draft.data(), counts.data(),
+            ids.data(), probs.data(), stride);
+}
+
+bool common_sampler_probabilistic_backend_enabled(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr && llama_sampler_speculative_rejection_backend_enabled(gsmpl->chain);
+}
+
+bool common_sampler_backend_sampling_enabled(const struct common_sampler * gsmpl) {
+    return gsmpl != nullptr && gsmpl->params.backend_sampling;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

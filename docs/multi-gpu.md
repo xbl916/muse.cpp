@@ -101,6 +101,14 @@ llama-cli -m model.gguf -sm tensor -ctk q8_0 -ctv q8_0 -fa on
 
 NCCL is selected at build time (`-DGGML_CUDA_NCCL=ON`, this is the default). Two CUDA GPUs use the lower-latency internal AllReduce by default. Three or more CUDA GPUs use NCCL on Linux. Set `GGML_CUDA_ALLREDUCE=nccl` or `GGML_CUDA_ALLREDUCE=internal` to override the runtime choice.
 
+For CUDA tensor-parallel decode, `GGML_CUDA_TP_GRAPHS=1` captures the decode path across Meta subgraphs and AllReduce boundaries. With the two-GPU internal transport, the final distributed-logit gather and its primary-only suffix execute after the captured TP prefix; this avoids persistent cross-graph polling while retaining 161 of 162 subgraphs on Qwen3.8-27B. NCCL may capture its compatible gather path directly. The option requires CUDA graphs and falls back to the piecewise path for incompatible graphs and prefill batches. The piecewise path keeps dynamic attention eager while stable regions between attention operations retain the CUDA backend's graph optimization. `GGML_CUDA_TP_GRAPH_MAX_BATCH` controls the largest eligible batch and defaults to `8`. `GGML_CUDA_TP_GRAPH_MAX_GRAPHS` limits the number of captured TP graph variants and defaults to `16`; reaching the limit disables TP capture and safely returns to eager execution instead of allowing dynamic graph variants to exhaust device memory.
+
+```bash
+GGML_CUDA_TP_GRAPHS=1 llama-server -m model.gguf -sm tensor -fa on
+```
+
+For two-GPU internal AllReduce combined with `--spec-draft-n-max 3`, set `GGML_CUDA_TP_GRAPH_MAX_BATCH=4` so the target verification batches are eligible. The internal graph path uses alternating mapped-host staging and arrival slots, avoiding the per-AllReduce acknowledgement serialization used by the original implementation. Use `-lv 4` when validating capture; successful runs print `captured TP CUDA graph ... (161/162 subgraphs, batch=4)` for Qwen3.8-27B. Batches above the limit execute eagerly.
+
 ```
 NVIDIA Collective Communications Library (NCCL) is unavailable, multi GPU performance will be suboptimal
 ```

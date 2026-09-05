@@ -71,7 +71,8 @@ static void top_k_cub(ggml_backend_cuda_context & ctx,
     // Multi-row backend sampling may consume the candidate indices from a
     // different meta-backend subgraph. Complete the single batched top-k here
     // so the following GET_ROWS cannot observe partially written indices.
-    if (nrows > 1) {
+    // A complete Meta graph keeps the producer and consumer ordered on the same captured stream.
+    if (nrows > 1 && !ctx.external_graph_capture) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
 

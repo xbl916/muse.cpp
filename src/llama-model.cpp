@@ -3133,6 +3133,16 @@ int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
 }
 
+int32_t llama_model_n_gpu_layers_for_paged(const struct llama_model * model) {
+    const auto & hparams = model->hparams;
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        if (hparams.has_kv(il) && !hparams.is_recr(il)) {
+            return hparams.n_layer_all + 1 - il;
+        }
+    }
+    return 0;
+}
+
 ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i) {
     if (i < 0 || i >= (int)model->devices.size()) {
         return nullptr;

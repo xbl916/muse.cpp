@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -74,6 +75,7 @@ struct common_log_entry {
     int64_t timestamp { 0 };
     bool is_end       { false }; // signals the worker thread to stop
     bool prefix       { false };
+    bool wall_clock   { false };
 
     common_log_entry(size_t size = 256) : msg(size) { }
 
@@ -95,14 +97,30 @@ struct common_log_entry {
 
         if (level != GGML_LOG_LEVEL_NONE && level != GGML_LOG_LEVEL_CONT && prefix) {
             if (timestamp) {
-                // [M.s.ms.us]
-                fprintf(fcur, "%s%d.%02d.%03d.%03d%s ",
-                        g_col[COMMON_LOG_COL_BLUE],
-                        (int) (timestamp / 1000000 / 60),
-                        (int) (timestamp / 1000000 % 60),
-                        (int) (timestamp / 1000 % 1000),
-                        (int) (timestamp % 1000),
-                        g_col[COMMON_LOG_COL_DEFAULT]);
+                if (wall_clock) {
+                    const time_t seconds = (time_t) (timestamp / 1000000);
+                    struct tm local_time;
+#if defined(_WIN32)
+                    localtime_s(&local_time, &seconds);
+#else
+                    localtime_r(&seconds, &local_time);
+#endif
+                    char time_buf[32];
+                    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &local_time);
+                    fprintf(fcur, "%s%s.%03d%s ",
+                            g_col[COMMON_LOG_COL_BLUE], time_buf,
+                            (int) (timestamp / 1000 % 1000),
+                            g_col[COMMON_LOG_COL_DEFAULT]);
+                } else {
+                    // [M.s.ms.us]
+                    fprintf(fcur, "%s%d.%02d.%03d.%03d%s ",
+                            g_col[COMMON_LOG_COL_BLUE],
+                            (int) (timestamp / 1000000 / 60),
+                            (int) (timestamp / 1000000 % 60),
+                            (int) (timestamp / 1000 % 1000),
+                            (int) (timestamp % 1000),
+                            g_col[COMMON_LOG_COL_DEFAULT]);
+                }
             }
 
             switch (level) {
@@ -131,6 +149,7 @@ struct common_log {
         file       = nullptr;
         prefix     = false;
         timestamps = false;
+        wall_clock = false;
         running    = false;
         t_start    = t_us();
 
@@ -158,6 +177,7 @@ private:
 
     bool prefix;
     bool timestamps;
+    bool wall_clock;
     bool running;
 
     int64_t t_start;
@@ -246,9 +266,11 @@ public:
         entry.is_end    = false;
         entry.level     = level;
         entry.prefix    = prefix;
+        entry.wall_clock = wall_clock;
         entry.timestamp = 0;
         if (timestamps) {
-            entry.timestamp = t_us() - t_start;
+            const int64_t now = t_us();
+            entry.timestamp = wall_clock ? now : now - t_start;
         }
 
         tail = (tail + 1) % queue.size();
@@ -360,6 +382,12 @@ public:
 
         this->timestamps = timestamps;
     }
+
+    void set_wall_clock(bool wall_clock) {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        this->wall_clock = wall_clock;
+    }
 };
 
 //
@@ -431,6 +459,10 @@ void common_log_set_prefix(struct common_log * log, bool prefix) {
 
 void common_log_set_timestamps(struct common_log * log, bool timestamps) {
     log->set_timestamps(timestamps);
+}
+
+void common_log_set_wall_clock(struct common_log * log, bool wall_clock) {
+    log->set_wall_clock(wall_clock);
 }
 
 void common_log_flush(struct common_log * log) {

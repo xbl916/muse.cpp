@@ -352,6 +352,8 @@ llama_context::llama_context(
     cparams.paged_kv = params.paged_kv;
     cparams.bf16_prefill = params.bf16_prefill;
     cparams.kv_block_size = params.kv_block_size;
+    cparams.paged_attn_sink = params.paged_attn_sink;
+    cparams.paged_attn_window = params.paged_attn_window;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -479,7 +481,10 @@ llama_context::llama_context(
 
         memory.reset(model.create_memory(params_mem, cparams));
 
-        if (cparams.paged_kv && (!memory || !memory->configure_paged(cparams.kv_block_size, cparams.n_ctx_seq))) {
+        if (cparams.paged_kv && (!memory || !memory->configure_paged(
+                    cparams.kv_block_size, cparams.n_ctx_seq,
+                    cparams.embeddings ? 0 : cparams.paged_attn_sink,
+                    cparams.embeddings ? 0 : cparams.paged_attn_window))) {
             throw std::runtime_error("paged KV is not supported by this model memory type");
         }
     }
@@ -669,10 +674,24 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
+        if (sched_need_reset) {
+            sched_need_reset = false;
+
+            const int64_t t_start_us = ggml_time_us();
+
+            synchronize();
+            ggml_backend_sched_reset(sched.get());
+            gf_res_prev->reset();
+            gf_res_reserve->reset();
+
+            LLAMA_LOG_INFO("%s: sampler graph reset took %.2f ms (full reserve skipped)\n",
+                    __func__, (ggml_time_us() - t_start_us)/1000.0);
+        }
         return;
     }
 
     sched_need_reserve = false;
+    sched_need_reset = false;
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -687,10 +706,18 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    gf_res_prev.reset(new llm_graph_result(max_nodes));
-    gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    // Keep allocator buffers when only the graph topology changes, such as when updating backend samplers.
+    if (!sched || max_nodes > sched_max_nodes) {
+        gf_res_prev.reset(new llm_graph_result(max_nodes));
+        gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        sched_max_nodes = max_nodes;
+    } else {
+        gf_res_prev->reset();
+        gf_res_reserve->reset();
+        ggml_backend_sched_reset(sched.get());
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1316,6 +1343,23 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         sampler->iface->backend_apply &&
         llama_sampler_chain_n(sampler) > 0;
 
+    const auto sampler_changed = [this]() {
+        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const size_t max_nodes = graph_max_nodes(n_tokens);
+
+        if (!sched || max_nodes > sched_max_nodes) {
+            sched_need_reserve = true;
+        } else {
+            sched_need_reset = true;
+        }
+    };
+
+    const auto existing = sampling.samplers.find(seq_id);
+    if (sampler != nullptr && existing != sampling.samplers.end() && existing->second == sampler) {
+        sampler_changed();
+        return true;
+    }
+
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
@@ -1323,7 +1367,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        sampler_changed();
 
         return true;
     }
@@ -1332,17 +1376,18 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            sampling.samplers.erase(seq_id);
+            sampler_changed();
+        } else {
+            sampling.samplers.erase(seq_id);
         }
-
-        sampling.samplers.erase(seq_id);
 
         return false;
     }
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    sampler_changed();
 
     return true;
 }
@@ -1350,6 +1395,14 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 bool llama_context::mtp_link_hidden_state(llama_context * ctx_dft) {
     if (ctx_dft == nullptr || ctx_dft->cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
         LLAMA_LOG_INFO("%s: MTP hidden staging unavailable: draft context type mismatch\n", __func__);
+        return false;
+    }
+    const bool target_multi_gpu_layer = model.split_mode() == LLAMA_SPLIT_MODE_LAYER && model.n_devices() > 1;
+    const bool draft_multi_gpu_layer = ctx_dft->model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
+            ctx_dft->model.n_devices() > 1;
+    if (target_multi_gpu_layer || draft_multi_gpu_layer) {
+        LLAMA_LOG_INFO("%s: device-resident MTP hidden staging disabled for multi-GPU layer mode; using host transfer\n",
+                __func__);
         return false;
     }
     if (const char * env = getenv("LLAMA_MTP_DEVICE_HIDDEN")) {
@@ -1730,7 +1783,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && mtp_hidden_bridge) {
             if (ggml_tensor * input_h = res->get_inp_h()) {
-                ggml_backend_sched_set_tensor_backend(sched.get(), input_h, backends.front().get());
+                ggml_backend_t input_backend = backends.front().get();
+                if (mtp_hidden_bridge->shards.size() == 1) {
+                    ggml_backend_dev_t stage_device = ggml_backend_get_device(mtp_hidden_bridge->shards.front().backend);
+                    for (const auto & backend : backends) {
+                        if (ggml_backend_get_device(backend.get()) == stage_device) {
+                            input_backend = backend.get();
+                            break;
+                        }
+                    }
+                }
+                ggml_backend_sched_set_tensor_backend(sched.get(), input_h, input_backend);
             }
         }
 
@@ -4003,6 +4066,8 @@ llama_context_params llama_context_default_params() {
         /*.n_ctx                       =*/ 512,
         /*.n_ctx_seq                   =*/ 0,
         /*.kv_block_size               =*/ 32,
+        /*.paged_attn_sink             =*/ 0,
+        /*.paged_attn_window           =*/ 0,
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
@@ -4066,6 +4131,11 @@ llama_context * llama_init_from_model(
 
     if (params.kv_block_size == 0 || (params.kv_block_size & (params.kv_block_size - 1)) != 0) {
         LLAMA_LOG_ERROR("%s: kv_block_size must be a positive power of two\n", __func__);
+        return nullptr;
+    }
+
+    if (params.paged_attn_window > 0 && !params.paged_kv) {
+        LLAMA_LOG_ERROR("%s: paged sparse attention requires paged_kv\n", __func__);
         return nullptr;
     }
 

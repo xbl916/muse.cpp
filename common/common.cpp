@@ -1823,6 +1823,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_ctx_seq         = params.max_model_len;
     cparams.kv_block_size     = params.kv_block_size;
+    cparams.paged_attn_sink   = params.paged_attn_sink;
+    cparams.paged_attn_window = params.paged_attn_window;
     cparams.n_seq_max         = params.n_parallel_max > 0 ? params.n_parallel_max : params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);

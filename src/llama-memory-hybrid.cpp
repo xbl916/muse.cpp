@@ -135,8 +135,13 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
-bool llama_memory_hybrid::configure_paged(uint32_t block_size, uint32_t max_seq_tokens) {
-    return mem_attn && mem_attn->configure_paged(block_size, max_seq_tokens);
+bool llama_memory_hybrid::configure_paged(
+        uint32_t block_size,
+        uint32_t max_seq_tokens,
+        uint32_t attn_sink_tokens,
+        uint32_t attn_window_tokens) {
+    return mem_attn && mem_attn->configure_paged(
+            block_size, max_seq_tokens, attn_sink_tokens, attn_window_tokens);
 }
 
 uint32_t llama_memory_hybrid::get_n_free_blocks() const {

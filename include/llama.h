@@ -360,6 +360,8 @@ extern "C" {
         uint32_t n_ctx;                 // text context, 0 = from model
         uint32_t n_ctx_seq;             // maximum context for one sequence, 0 = derived from n_ctx
         uint32_t kv_block_size;          // paged KV block size in tokens
+        uint32_t paged_attn_sink;        // tokens kept at the start of sparse paged decode attention
+        uint32_t paged_attn_window;      // recent tokens kept by sparse paged decode attention, 0 = disabled
         uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;              // physical maximum batch size
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
@@ -1352,6 +1354,22 @@ extern "C" {
     // a type of llama_sampler that can chain multiple samplers one after another
 
     LLAMA_API struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_params params);
+
+    // Internal speculative-decoding stage that performs p/q rejection inside
+    // the backend sampling graph. q_ids/q_probs contain n_draft rows with
+    // q_stride entries; q_counts gives the valid entries in each row.
+    LLAMA_API struct llama_sampler * llama_sampler_init_speculative_rejection(
+            int32_t n_vocab, int32_t max_q, uint32_t seed);
+    LLAMA_API bool llama_sampler_speculative_rejection_set(
+            struct llama_sampler * chain,
+            int32_t n_draft,
+            const llama_token * draft,
+            const int32_t * q_counts,
+            const llama_token * q_ids,
+            const float * q_probs,
+            int32_t q_stride);
+    LLAMA_API bool llama_sampler_speculative_rejection_backend_enabled(
+            const struct llama_sampler * chain);
 
     // important: takes ownership of the sampler object and will free it when llama_sampler_free is called
     LLAMA_API void                   llama_sampler_chain_add(      struct llama_sampler * chain, struct llama_sampler * smpl);

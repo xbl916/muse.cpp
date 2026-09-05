@@ -4,6 +4,7 @@
 
 #include "common.h"
 
+#include <random>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,14 @@
 //
 
 struct common_sampler;
+
+struct common_speculative_diagnostics {
+    std::vector<uint64_t> n;
+    std::vector<uint64_t> target_argmax_matches;
+    std::vector<double> target_draft_prob_sum;
+
+    void reset();
+};
 
 // llama_sampler API overloads
 
@@ -89,10 +98,41 @@ llama_token common_sampler_sample_prepared(struct common_sampler * gsmpl, bool g
 //
 // returns at least 1 token, up to idxs.size()
 //
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        bool grammar_first = false,
+        struct common_speculative_diagnostics * diagnostics = nullptr);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+
+// Verify stochastic draft tokens without changing the target distribution.
+// Each draft distribution may be sparse; omitted tokens have probability zero.
+std::vector<llama_token> common_sampler_sample_and_accept_n_probabilistic(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_probs,
+        std::mt19937 & rng,
+        bool grammar_first = false);
+
+// Append and configure the CUDA-graph speculative rejection stage. The stage
+// is a CPU no-op when backend sampling is unavailable.
+void common_sampler_enable_probabilistic_backend(
+        struct common_sampler * gsmpl, const struct llama_model * model, uint32_t seed);
+bool common_sampler_set_probabilistic_draft(
+        struct common_sampler * gsmpl,
+        const llama_tokens & draft,
+        const std::vector<std::vector<llama_token_data>> & draft_probs);
+bool common_sampler_probabilistic_backend_enabled(const struct common_sampler * gsmpl);
+
+// Whether this sampler may be installed on the model context. This reflects
+// compatibility fallbacks applied while constructing the sampler.
+bool common_sampler_backend_sampling_enabled(const struct common_sampler * gsmpl);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

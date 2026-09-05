@@ -26,6 +26,7 @@ int main() {
                 if (rand () % 10 < 5) {
                     common_log_set_timestamps(common_log_main(), rand() % 2);
                     common_log_set_prefix    (common_log_main(), rand() % 2);
+                    common_log_set_wall_clock(common_log_main(), rand() % 2);
                 }
             }
         });

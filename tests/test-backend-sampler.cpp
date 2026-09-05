@@ -33,10 +33,10 @@ struct test_params {
 static llama_model_ptr load_model(const test_args & args) {
     auto mparams = llama_model_default_params();
 
-    ggml_backend_dev_t devs[2] = { nullptr, nullptr };
+    ggml_backend_dev_t devs[3] = { nullptr, nullptr, nullptr };
 
     if (args.device != "auto") {
-        if (args.device == "gpu") {
+        if (args.device == "gpu" || args.device == "tp") {
             devs[0] = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
 
             if (devs[0] == nullptr) {
@@ -45,6 +45,20 @@ static llama_model_ptr load_model(const test_args & args) {
             }
 
             mparams.n_gpu_layers = 999;
+            if (args.device == "tp") {
+                mparams.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+                size_t n_gpu = 0;
+                for (size_t i = 0; i < ggml_backend_dev_count() && n_gpu < 2; ++i) {
+                    ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        devs[n_gpu++] = dev;
+                    }
+                }
+                if (n_gpu < 2) {
+                    fprintf(stderr, "Error: TP test requires two GPU devices\n");
+                    return nullptr;
+                }
+            }
         } else if (args.device == "cpu") {
             devs[0] = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
 
@@ -1543,6 +1557,20 @@ static void test_backend_set_sampler(const test_params & params) {
     const std::string backend_token_str = test_ctx.token_to_piece(backend_token, false);
     printf("dist sampled token = %d, string='%s'\n", backend_token, backend_token_str.c_str());
 
+    // Replace the sampler with an equivalent graph topology. The context should
+    // reuse the existing scheduler capacity and bind the new sampler state.
+    llama_sampler_ptr replacement_sampler_chain(llama_sampler_chain_init(backend_chain_params));
+    llama_sampler_chain_add(replacement_sampler_chain.get(), llama_sampler_init_dist(seed + 1));
+    GGML_ASSERT(llama_set_sampler(test_ctx.ctx.get(), seq_id, replacement_sampler_chain.get()));
+
+    if (!test_ctx.decode_tokens({ { seq_id, backend_token } })) {
+        GGML_ASSERT(false && "Failed to decode token with replacement sampler");
+    }
+
+    batch_idx = test_ctx.idx_for_seq(seq_id);
+    backend_token = llama_get_sampled_token_ith(test_ctx.ctx.get(), batch_idx);
+    GGML_ASSERT(backend_token >= 0 && backend_token < test_ctx.n_vocab);
+
     // Now clear the backend sampler for this sequence.
     llama_set_sampler(test_ctx.ctx.get(), seq_id, nullptr);
     printf("Cleared backend sampler for seq_id %d\n", seq_id);
@@ -2006,6 +2034,55 @@ static void test_backend_multi_output_sampling_chain(const test_params & params)
     printf("backend multi-output sampling chain test PASSED\n");
 }
 
+static void test_backend_speculative_rejection(const test_params & params) {
+    const llama_seq_id seq_id = 0;
+    const llama_vocab * vocab = llama_model_get_vocab(params.model.get());
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const llama_token bos = llama_vocab_bos(vocab);
+
+    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_penalties(n_vocab, 64, 1.0f, 0.0f, 1.5f));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(20));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_top_p(0.8f, 1));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_temp(0.7f));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(424242));
+    llama_sampler_chain_add(chain.get(), llama_sampler_init_speculative_rejection(n_vocab, 10, 424242));
+
+    std::vector<llama_sampler_seq_config> configs = {{ seq_id, chain.get() }};
+    test_context test_ctx(params, configs, 1, 4, 4, 4);
+
+    const llama_token draft[] = { bos, bos, bos };
+    const int32_t q_counts[] = { 2, 2, 2 };
+    llama_token q_ids[30] = {};
+    float q_probs[30] = {};
+    for (int i = 0; i < 3; ++i) {
+        q_ids[i*10 + 0] = bos;
+        q_ids[i*10 + 1] = (bos + 1) % n_vocab;
+        q_probs[i*10 + 0] = 0.75f;
+        q_probs[i*10 + 1] = 0.25f;
+    }
+    GGML_ASSERT(llama_sampler_speculative_rejection_set(
+            chain.get(), 3, draft, q_counts, q_ids, q_probs, 10));
+    GGML_ASSERT(llama_set_sampler(test_ctx.ctx.get(), seq_id, chain.get()));
+
+    llama_batch batch = llama_batch_init(4, 0, 1);
+    for (int32_t i = 0; i < 4; ++i) {
+        common_batch_add(batch, bos, i, { seq_id }, true);
+    }
+    GGML_ASSERT(llama_decode(test_ctx.ctx.get(), batch) == 0);
+    for (int32_t i = 0; i < 4; ++i) {
+        const llama_token token = llama_get_sampled_token_ith(test_ctx.ctx.get(), i);
+        GGML_ASSERT(token >= 0 && token < n_vocab);
+        GGML_ASSERT(llama_get_sampled_probs_ith(test_ctx.ctx.get(), i) != nullptr);
+        GGML_ASSERT(llama_get_sampled_logits_ith(test_ctx.ctx.get(), i) != nullptr);
+        GGML_ASSERT(llama_get_sampled_candidates_ith(test_ctx.ctx.get(), i) != nullptr);
+        GGML_ASSERT(llama_get_sampled_candidates_count_ith(test_ctx.ctx.get(), i) > 0);
+    }
+    llama_batch_free(batch);
+
+    printf("backend speculative rejection test PASSED\n");
+}
+
 static void test_backend_multi_output_cpu_suffix(const test_params & params) {
     const llama_seq_id seq_id = 0;
     const int32_t k = 8;
@@ -2090,6 +2167,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "multi_sequence_multi_output_dist", test_backend_multi_sequence_multi_output_dist, true },
     { "multi_output_dist_transaction", test_backend_multi_output_dist_transaction, true },
     { "multi_output_sampling_chain", test_backend_multi_output_sampling_chain, true },
+    { "speculative_rejection", test_backend_speculative_rejection, true },
     { "multi_output_cpu",      test_backend_multi_output_cpu_suffix, true },
     { "mixed",           test_backend_mixed_sampling,          true  },
     { "min_p",           test_backend_min_p_sampling,          true  },
@@ -2148,8 +2226,8 @@ static test_args parse_cli(int argc, char ** argv) {
         exit(EXIT_FAILURE);
     }
 
-    if (out.device != "cpu" && out.device != "gpu" && out.device != "auto") {
-        fprintf(stderr, "Invalid device '%s'. Must be 'cpu', 'gpu' or 'auto'\n", out.device.c_str());
+    if (out.device != "cpu" && out.device != "gpu" && out.device != "tp" && out.device != "auto") {
+        fprintf(stderr, "Invalid device '%s'. Must be 'cpu', 'gpu', 'tp' or 'auto'\n", out.device.c_str());
         exit(EXIT_FAILURE);
     }
 

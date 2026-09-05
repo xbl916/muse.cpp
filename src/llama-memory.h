@@ -86,9 +86,15 @@ struct llama_memory_i {
 
     virtual ~llama_memory_i() = default;
 
-    virtual bool configure_paged(uint32_t block_size, uint32_t max_seq_tokens) {
+    virtual bool configure_paged(
+            uint32_t block_size,
+            uint32_t max_seq_tokens,
+            uint32_t attn_sink_tokens,
+            uint32_t attn_window_tokens) {
         GGML_UNUSED(block_size);
         GGML_UNUSED(max_seq_tokens);
+        GGML_UNUSED(attn_sink_tokens);
+        GGML_UNUSED(attn_window_tokens);
         return false;
     }
 

@@ -210,6 +210,8 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
 
 Use `--backend-sampling` to run supported target-model samplers on the model backend. Draft-model sampling uses the backend by default and can be controlled with `--spec-draft-backend-sampling` and `--no-spec-draft-backend-sampling`.
 
+For MTP models, `--spec-draft-probabilistic` samples draft tokens and verifies them with the standard `min(1, p/q)` rejection rule. This can improve acceptance when the MTP distribution is useful but its top-1 token differs from the target model, especially during higher-temperature reasoning. It preserves the target distribution by sampling rejected positions from `max(p - q, 0)`. Target `p/q` verification and residual sampling run in the backend sampling graph. Draft sampling remains on the host so the verifier retains the complete `q` distribution; probabilistic mode therefore ignores `--spec-draft-backend-sampling`. Model evaluation remains on the GPU. Use `--no-spec-draft-probabilistic` for greedy top-1 verification.
+
 Unsupported samplers and device layouts fall back to CPU sampling. Tensor split mode does not support backend sampling. A fixed seed produces repeatable random draws, but stochastic CPU and backend sampling can still select different tokens because floating-point operations can differ between implementations and devices. Use greedy sampling when exact output matching is required.
 
 ### Synthetic Acceptance

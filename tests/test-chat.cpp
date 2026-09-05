@@ -7058,6 +7058,197 @@ static void test_reasoning_budget_message_per_request() {
     }
 }
 
+static void test_reasoning_budget_by_effort() {
+    LOG_DBG("%s\n", __func__);
+
+    auto parse = [](json body, const std::string & default_effort = "") {
+        server_chat_params opt;
+        opt.tmpls = read_templates("models/templates/Qwen-Qwen3-0.6B.jinja");
+        opt.use_jinja = true;
+        opt.enable_thinking = true;
+        opt.reasoning_budget = 777;
+        opt.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+        opt.reasoning_budget_by_effort = {
+            {"low", 4096},
+            {"high", 12288},
+            {"xhigh", 16384},
+        };
+        opt.reasoning_converge_ratio_by_effort = {
+            {"low", 0.75f},
+            {"high", 0.75f},
+            {"xhigh", 0.80f},
+        };
+        opt.reasoning_converge_tokens_by_effort = {
+            {"low", 768},
+            {"high", 2048},
+            {"xhigh", 3072},
+        };
+        opt.reasoning_converge_bias_delay_by_effort = {
+            {"low", 64},
+            {"high", 192},
+            {"xhigh", 256},
+        };
+        opt.reasoning_converge_marker = "<|reasoning_converge|>";
+        opt.reasoning_converge_message = "stop planning";
+        opt.reasoning_converge_boundary_tokens = 96;
+        opt.reasoning_converge_max_bias = 6.0f;
+        opt.reasoning_hard_boundary_tokens = 96;
+        opt.reasoning_budget_soft_ratio = -1.0f;
+        opt.reasoning_budget_soft_message = "wrap up";
+        opt.reasoning_budget_soft_boundary_tokens = 64;
+        if (!default_effort.empty()) {
+            opt.chat_template_kwargs["reasoning_effort"] = json(default_effort).dump();
+        }
+
+        std::vector<raw_buffer> out_files;
+        return oaicompat_chat_params_parse(body, opt, out_files);
+    };
+
+    const auto make_body = [](const std::string & effort) {
+        return json {
+            {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+            {"reasoning_effort", effort},
+        };
+    };
+
+    {
+        const auto params = parse(make_body("low"));
+        GGML_ASSERT(params.at("reasoning_budget_tokens").get<int>() == 4096);
+        GGML_ASSERT(params.at("reasoning_converge_ratio").get<float>() == 0.75f);
+        GGML_ASSERT(params.at("reasoning_converge_tokens").get<int>() == 768);
+        GGML_ASSERT(params.at("reasoning_handoff_bias_delay_tokens").get<int>() == 64);
+        GGML_ASSERT(params.at("reasoning_converge_boundary_tokens").get<int>() == 96);
+        GGML_ASSERT(params.at("reasoning_converge_marker").get<std::string>() == "<|reasoning_converge|>");
+        GGML_ASSERT(params.at("reasoning_converge_message").get<std::string>() == "stop planning");
+        GGML_ASSERT(params.at("reasoning_budget_soft_ratio").get<float>() == -1.0f);
+        GGML_ASSERT(params.at("prompt").get<std::string>().find("server control signal") == std::string::npos);
+        GGML_ASSERT(params.at("prompt").get<std::string>().find("<|reasoning_converge|>") == std::string::npos);
+    }
+
+    {
+        const auto params = parse(make_body("medium"));
+        GGML_ASSERT(params.at("reasoning_budget_tokens").get<int>() == -1);
+        GGML_ASSERT(params.at("reasoning_converge_ratio").get<float>() == -1.0f);
+        GGML_ASSERT(params.at("reasoning_converge_tokens").get<int>() == -1);
+        GGML_ASSERT(params.at("reasoning_budget_soft_ratio").get<float>() == -1.0f);
+        GGML_ASSERT(params.at("prompt").get<std::string>().find("server control signal") == std::string::npos);
+    }
+
+    {
+        auto body = make_body("low");
+        body["reasoning_budget_tokens"] = 2048;
+        body["reasoning_converge_marker"] = "[CUSTOM]";
+        body["reasoning_handoff_transition"] = "custom convergence instruction";
+        body["reasoning_handoff_bias_delay_tokens"] = 32;
+        const auto params = parse(body);
+        GGML_ASSERT(params.at("reasoning_budget_tokens").get<int>() == 2048);
+        GGML_ASSERT(params.at("reasoning_converge_ratio").get<float>() == 0.75f);
+        GGML_ASSERT(params.at("reasoning_converge_tokens").get<int>() == 768);
+        GGML_ASSERT(params.at("reasoning_converge_marker").get<std::string>() == "[CUSTOM]");
+        GGML_ASSERT(params.at("reasoning_converge_message").get<std::string>() == "custom convergence instruction");
+        GGML_ASSERT(params.at("reasoning_handoff_bias_delay_tokens").get<int>() == 32);
+        GGML_ASSERT(params.at("reasoning_budget_soft_ratio").get<float>() == -1.0f);
+    }
+
+    {
+        json body = {
+            {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+        };
+        const auto params = parse(body, "xhigh");
+        GGML_ASSERT(params.at("reasoning_budget_tokens").get<int>() == 16384);
+        GGML_ASSERT(params.at("reasoning_converge_ratio").get<float>() == 0.80f);
+        GGML_ASSERT(params.at("reasoning_converge_tokens").get<int>() == 3072);
+        GGML_ASSERT(params.at("reasoning_handoff_bias_delay_tokens").get<int>() == 256);
+        GGML_ASSERT(params.at("reasoning_budget_soft_ratio").get<float>() == -1.0f);
+    }
+
+    {
+        json body = {
+            {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+        };
+        const auto params = parse(body);
+        GGML_ASSERT(params.at("reasoning_budget_tokens").get<int>() == 777);
+        GGML_ASSERT(params.at("reasoning_converge_ratio").get<float>() == -1.0f);
+        GGML_ASSERT(params.at("reasoning_converge_tokens").get<int>() == -1);
+        GGML_ASSERT(params.at("reasoning_budget_soft_ratio").get<float>() == -1.0f);
+    }
+
+    {
+        const auto params = parse(make_body("high"));
+        GGML_ASSERT(params.at("reasoning_budget_tokens").get<int>() == 12288);
+        GGML_ASSERT(params.at("reasoning_converge_ratio").get<float>() == 0.75f);
+        GGML_ASSERT(params.at("reasoning_converge_tokens").get<int>() == 2048);
+        GGML_ASSERT(params.at("reasoning_handoff_bias_delay_tokens").get<int>() == 192);
+        GGML_ASSERT(params.at("prompt").get<std::string>().find("<|reasoning_converge|>") == std::string::npos);
+    }
+
+    {
+        const std::string xhigh_template =
+            "{%- set supported_efforts = ['low', 'medium', 'xhigh'] -%}"
+            "NATIVE={{ reasoning_effort }}\n"
+            "{%- for message in messages %}{{ message['content'] }}{%- endfor %}";
+        server_chat_params opt;
+        opt.tmpls = common_chat_templates_ptr(common_chat_templates_init(nullptr, xhigh_template));
+        opt.use_jinja = true;
+        opt.enable_thinking = true;
+        opt.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+        json body = make_body("high");
+        std::vector<raw_buffer> out_files;
+        const auto params = oaicompat_chat_params_parse(body, opt, out_files);
+        GGML_ASSERT(params.at("prompt").get<std::string>().find("NATIVE=xhigh") != std::string::npos);
+    }
+
+    {
+        json body = {
+            {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+            {"reasoning_converge_ratio", 0.6f},
+            {"reasoning_converge_tokens", 128},
+        };
+        const auto params = parse(body);
+        GGML_ASSERT(params.at("reasoning_budget_tokens").get<int>() == 777);
+        GGML_ASSERT(params.at("reasoning_converge_ratio").get<float>() == 0.6f);
+        GGML_ASSERT(params.at("reasoning_converge_tokens").get<int>() == 128);
+        GGML_ASSERT(params.at("prompt").get<std::string>().find("server control signal") == std::string::npos);
+    }
+
+    {
+        const auto params = parse(make_body("none"), "xhigh");
+        GGML_ASSERT(params.at("reasoning_budget_tokens").get<int>() == -1);
+        GGML_ASSERT(params.at("reasoning_converge_ratio").get<float>() == -1.0f);
+        GGML_ASSERT(params.at("reasoning_converge_tokens").get<int>() == -1);
+        GGML_ASSERT(params.at("reasoning_handoff_bias_delay_tokens").get<int>() == 0);
+        GGML_ASSERT(params.at("reasoning_hard_boundary_tokens").get<int>() == 0);
+        GGML_ASSERT(params.at("reasoning_budget_soft_ratio").get<float>() == -1.0f);
+        GGML_ASSERT(params.at("reasoning_budget_grace_tokens").get<int>() == 0);
+        GGML_ASSERT(params.at("reasoning_budget_soft_boundary_tokens").get<int>() == 0);
+        GGML_ASSERT(!params.at("reasoning_control").get<bool>());
+    }
+
+    {
+        auto body = make_body("low");
+        body["chat_template_kwargs"] = {{"enable_thinking", false}};
+        body["reasoning_budget_tokens"] = 1024;
+        body["reasoning_budget_soft_ratio"] = 0.5f;
+        body["reasoning_budget_grace_tokens"] = 128;
+        body["reasoning_budget_soft_boundary_tokens"] = 32;
+        body["reasoning_converge_ratio"] = 0.5f;
+        body["reasoning_converge_tokens"] = 256;
+        body["reasoning_control"] = true;
+        const auto params = parse(body);
+        GGML_ASSERT(params.at("reasoning_budget_tokens").get<int>() == -1);
+        GGML_ASSERT(params.at("reasoning_converge_ratio").get<float>() == -1.0f);
+        GGML_ASSERT(params.at("reasoning_converge_tokens").get<int>() == -1);
+        GGML_ASSERT(params.at("reasoning_converge_boundary_tokens").get<int>() == 0);
+        GGML_ASSERT(params.at("reasoning_handoff_bias_delay_tokens").get<int>() == 0);
+        GGML_ASSERT(params.at("reasoning_hard_boundary_tokens").get<int>() == 0);
+        GGML_ASSERT(params.at("reasoning_budget_soft_ratio").get<float>() == -1.0f);
+        GGML_ASSERT(params.at("reasoning_budget_grace_tokens").get<int>() == 0);
+        GGML_ASSERT(params.at("reasoning_budget_soft_boundary_tokens").get<int>() == 0);
+        GGML_ASSERT(!params.at("reasoning_control").get<bool>());
+        GGML_ASSERT(params.at("prompt").get<std::string>().find("server control signal") == std::string::npos);
+    }
+}
+
 static void test_reasoning_effort_caps() {
     LOG_DBG("%s\n", __func__);
 
@@ -7238,6 +7429,7 @@ int main(int argc, char ** argv) {
         test_reasoning_effort_caps();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
+        test_reasoning_budget_by_effort();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }

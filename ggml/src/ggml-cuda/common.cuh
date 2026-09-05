@@ -1243,6 +1243,7 @@ struct ggml_cuda_graph {
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
+    bool disable_due_to_capture_error = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
@@ -1256,7 +1257,7 @@ struct ggml_cuda_graph {
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
-        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
+        return !(disable_due_to_gpu_arch || disable_due_to_capture_error || disable_cuda_graphs_due_to_env);
     }
 #endif
 };
@@ -1436,6 +1437,9 @@ struct ggml_backend_cuda_context {
 
     bool mmq_q8_cache_active = false;
     std::vector<mmq_q8_cache_entry> mmq_q8_cache;
+
+    // Set while a composite backend captures several ggml graphs and communication operations as one CUDA graph.
+    bool external_graph_capture = false;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

@@ -11,6 +11,8 @@ struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t kv_block_size;
+    uint32_t paged_attn_sink;
+    uint32_t paged_attn_window;
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;

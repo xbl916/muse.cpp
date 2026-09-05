@@ -46,6 +46,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_mixed_fallback(ggml_backend_cuda_co
             ggml_cuda_flash_attn_ext_vec_mixed_case<DKQ, ncols1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0>(ctx, dst);
         } else if (type_K == GGML_TYPE_Q5_1 && type_V == GGML_TYPE_Q5_1) {
             ggml_cuda_flash_attn_ext_vec_mixed_case<DKQ, ncols1, GGML_TYPE_Q5_1, GGML_TYPE_Q5_1>(ctx, dst);
+        } else if (type_K == GGML_TYPE_BF16 && type_V == GGML_TYPE_BF16) {
+            ggml_cuda_flash_attn_ext_vec_mixed_case<DKQ, ncols1, GGML_TYPE_BF16, GGML_TYPE_BF16>(ctx, dst);
         } else {
             GGML_ASSERT(type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0);
             ggml_cuda_flash_attn_ext_vec_mixed_case<DKQ, ncols1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
@@ -536,9 +538,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             (K->type == GGML_TYPE_Q5_0 && V->type == GGML_TYPE_Q5_0) ||
             (K->type == GGML_TYPE_Q5_1 && V->type == GGML_TYPE_Q5_1) ||
             (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0);
-        const bool quant_mma = quant_mma_type &&
-            turing_mma_available(cc) && Q->ne[0] == 256 && Q->ne[1] >= quant_mma_min_queries && gqa_ratio % 2 == 0;
-        if (quant_mma) {
+        const bool bf16_mma_type = K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16 && ampere_mma_available(cc);
+        const int bf16_mma_min_queries = cc >= GGML_CUDA_CC_ADA_LOVELACE ? 64 : 32;
+        const bool paged_mma_shape = Q->ne[0] == 256 && gqa_ratio % 2 == 0;
+        const bool quant_mma = quant_mma_type && turing_mma_available(cc) &&
+            paged_mma_shape && Q->ne[1] >= quant_mma_min_queries;
+        const bool bf16_mma = bf16_mma_type && paged_mma_shape && Q->ne[1] >= bf16_mma_min_queries;
+        if (quant_mma || bf16_mma) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
         const bool f16_tiles = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
@@ -647,7 +653,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = !(dst->src[5] && K->type == V->type &&
                 (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q4_1 ||
-                 K->type == GGML_TYPE_Q5_0 || K->type == GGML_TYPE_Q5_1 || K->type == GGML_TYPE_Q8_0));
+                 K->type == GGML_TYPE_Q5_0 || K->type == GGML_TYPE_Q5_1 ||
+                 K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_BF16));
             need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC:

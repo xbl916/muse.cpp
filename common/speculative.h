@@ -69,6 +69,10 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // Optional normalized draft distributions, one sparse distribution per
+    // generated token. Used by probabilistic rejection verification.
+    std::vector<std::vector<llama_token_data>> * probs = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -76,8 +80,14 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
+// Clear transient per-sequence speculative state. The caller owns KV removal.
+void common_speculative_reset_seq(common_speculative * spec, llama_seq_id seq_id);
+
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+
+// Return the llama_decode() error from the last failed process(), or zero if unavailable.
+int32_t common_speculative_get_last_process_error(const common_speculative * spec);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);

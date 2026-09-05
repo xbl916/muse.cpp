@@ -159,11 +159,15 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
+    int32_t process_error = 0; // llama_decode() result from the last failed process(), if any
+
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
     virtual ~common_speculative_impl() = default;
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
+
+    virtual void reset(llama_seq_id /*seq_id*/) {}
 
     virtual bool process(const llama_batch & batch) = 0;
 
@@ -1409,13 +1413,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
+        if (this->params.probabilistic && this->params.backend_sampling) {
+            SPC_WRN("%s", "probabilistic MTP keeps draft sampling on the host to retain the complete q distribution\n");
+            this->params.backend_sampling = false;
+        }
+
         n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
         GGML_ASSERT(n_embd == llama_model_n_embd_out(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
-        SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+        SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d, proposal=%s\n",
+                this->params.n_max, this->params.n_min, this->params.p_min, n_embd,
+                (int) this->params.backend_sampling,
+                this->params.probabilistic ? "probabilistic-pq" : "greedy");
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -1435,7 +1447,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             common_params_sampling sparams;
             sparams.no_perf  = false;
             sparams.top_k    = 10;
+            sparams.temp     = 0.0f;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            if (!this->params.probabilistic) {
+                sparams.samplers.push_back(COMMON_SAMPLER_TYPE_TEMPERATURE);
+            }
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
@@ -1445,6 +1461,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                if (!this->params.probabilistic) {
+                    llama_sampler_chain_add(chain, llama_sampler_init_temp(0.0f));
+                }
+                llama_sampler_chain_add(chain, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1524,7 +1544,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    void reset(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        verify_pos_first[seq_id] = -1;
+        verify_h_device[seq_id] = false;
+        i_last[seq_id] = -1;
+        i_batch_beg[seq_id] = -1;
+        i_batch_end[seq_id] = -1;
+        if (chain_heads) {
+            chain_h[seq_id].clear();
+        }
+        common_sampler_reset(smpls[seq_id].get());
+        llama_mtp_set_pending_hidden(params.ctx_dft, seq_id, pending_h[seq_id].data());
+    }
+
     bool process(const llama_batch & batch_in) override {
+        process_error = 0;
+
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1615,6 +1657,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
+                    process_error = rc;
                     ok = false;
                     break;
                 }
@@ -1736,7 +1779,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                const llama_token sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = pending_on_device ? nullptr :
                         llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
@@ -1749,10 +1792,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                const llama_token id = params.probabilistic ? sampled : cur_p->data[0].id;
 
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                float selected_p = 0.0f;
+                for (size_t k = 0; k < cur_p->size; ++k) {
+                    if (cur_p->data[k].id == id) {
+                        selected_p = cur_p->data[k].p;
+                        break;
+                    }
+                }
+
+                // p_min gates the distribution as a whole. In probabilistic
+                // mode, gating the sampled token would condition q without
+                // renormalizing it and invalidate rejection verification.
+                const float confidence = params.probabilistic ? cur_p->data[0].p : selected_p;
+                if (confidence < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1765,6 +1819,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+                if (params.probabilistic && dp.probs != nullptr) {
+                    auto & probs = dp.probs->emplace_back();
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        if (std::isfinite(cur_p->data[k].p) && cur_p->data[k].p > 0.0f) {
+                            probs.push_back(cur_p->data[k]);
+                        }
+                    }
+                }
 
                 if (params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
@@ -2270,6 +2332,8 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    int32_t last_process_error = 0;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -2865,6 +2929,21 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
+void common_speculative_reset_seq(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) spec->dparams.size());
+
+    spec->dparams[seq_id] = {};
+    spec->impl_last[seq_id] = nullptr;
+
+    for (auto & impl : spec->impls) {
+        impl->reset(seq_id);
+    }
+}
+
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
     bool result = true;
 
@@ -2872,11 +2951,23 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
         return result;
     }
 
+    spec->last_process_error = 0;
+
     for (auto & impl : spec->impls) {
-        result = result && impl->process(batch);
+        if (!impl->process(batch)) {
+            if (spec->last_process_error == 0) {
+                spec->last_process_error = impl->process_error;
+            }
+            result = false;
+            break;
+        }
     }
 
     return result;
+}
+
+int32_t common_speculative_get_last_process_error(const common_speculative * spec) {
+    return spec ? spec->last_process_error : 0;
 }
 
 void common_speculative_draft(common_speculative * spec) {
